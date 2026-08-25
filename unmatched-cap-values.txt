@@ -1,0 +1,7 @@
+5 names in cap-values.csv weren't found in players:
+
+"Charlie Smyth"  ->  no close match found among real players at all
+"Bam Knight"  ->  no close match found among real players at all
+"Kyle Juszczyk"  ->  no close match found among real players at all
+"Tommy Myers"  ->  no close match found among real players at all
+"Hunter Luepke"  ->  no close match found among real players at all

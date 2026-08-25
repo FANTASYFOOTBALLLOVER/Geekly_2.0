@@ -1,0 +1,23 @@
+{
+  "name": "roster-lease",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "import:players": "node scripts/importPlayers.js",
+    "import:crosswalk": "node scripts/importIdCrosswalk.js",
+    "import:stats": "node scripts/importHistoricalStats.js",
+    "import:live": "node scripts/importLiveStats.js",
+    "import:schedule": "node scripts/importSchedule.js",
+    "import:projections-csv": "node scripts/importProjectionsCsv.js",
+    "import:cap-values": "node scripts/importCapValues.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

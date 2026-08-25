@@ -1,0 +1,7 @@
+node_modules/
+.env
+web/.env
+.DS_Store
+web/.DS_Store
+web/src/.DS_Store
+web/dist/
