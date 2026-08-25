@@ -73,8 +73,8 @@ export default function Login({ onNavigate, onLoggedIn }) {
     }
 
     await supabase.auth.resetPasswordForEmail(resolvedEmail, {
-      redirectTo: window.location.origin,
-    });
+  redirectTo: 'https://geeklyfantasy.com',
+});
     setShowResetSentPopup(true);
   }
 

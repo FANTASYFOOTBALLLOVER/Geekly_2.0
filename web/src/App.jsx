@@ -72,12 +72,30 @@ export default function App() {
         setView('reset-password');
         return;
       }
-      if (!session) {
+      if (_event === 'SIGNED_OUT') {
         setProfile(null);
         setView('landing');
         return;
       }
-      fetchProfile(session).then((profileRow) => setProfile(profileRow));
+      if (_event === 'SIGNED_IN' && session) {
+        fetchProfile(session).then((profileRow) => {
+          setProfile(profileRow);
+          if (!profileRow || !profileRow.username) {
+            setView('username-setup');
+          } else {
+            setView('home');
+          }
+        });
+        return;
+      }
+      // Any other event (TOKEN_REFRESHED, INITIAL_SESSION, USER_UPDATED, etc.)
+      // is routine background upkeep, not a real sign-in — never change the
+      // current view for these, so switching tabs or sitting idle for a
+      // while never yanks someone out of wherever they currently are,
+      // mid-draft included.
+      if (session) {
+        fetchProfile(session).then((profileRow) => setProfile(profileRow));
+      }
     });
 
     return () => listener.subscription.unsubscribe();
@@ -103,8 +121,8 @@ export default function App() {
   if (view === 'username-setup') return <UsernameSetup onDone={() => setView('home')} />;
   if (view === 'reset-password') return <ResetPassword onDone={() => setView('home')} />;
   if (view === 'home') return <Home profile={profile} onLogout={handleLogout} onNavigate={handleNavigate} />;
-  if (view === 'mock-draft') return <MockDraft league={draftLeagueContext} profile={profile} onBack={() => setView('home')} />;
-  if (view === 'draft-room') return <DraftRoom league={draftLeagueContext} profile={profile} onBack={() => setView('home')} />;
+  if (view === 'mock-draft') return <MockDraft key={draftLeagueContext?.league_id} league={draftLeagueContext} profile={profile} onBack={() => setView('home')} />;
+  if (view === 'draft-room') return <DraftRoom key={draftLeagueContext?.league_id} league={draftLeagueContext} profile={profile} onBack={() => setView('home')} />;
 
   return <Landing onNavigate={setView} />;
 }

@@ -666,6 +666,7 @@ useEffect(() => {
 
     for (const s of slots) {
       if (s.completed) continue;
+      if (s.highBidder !== 'me') continue;
       const weeksEntered = s.committedWeeks;
       const baseAmount = s.highBid;
       if (weeksEntered <= 0 || baseAmount <= 0) continue;
@@ -675,10 +676,9 @@ useEffect(() => {
       if (!coversThisWeek) continue;
       const previewCost = costAtWeekWithBye(baseAmount, currentWeek, weekNumber, interestRatePerWeek, byeWeek);
       if (previewCost === 0) continue;
-      const previewColor = s.highBidder === 'me' ? 'var(--color-success)' : '#ff1493';
       segments.push({
         value: previewCost,
-        color: previewColor,
+        color: 'var(--color-success)',
         meta: [{ name: `${s.player.full_name} (pending)`, cost: previewCost }],
       });
     }
@@ -925,9 +925,9 @@ useEffect(() => {
 
       {/* My Team box — top right */}
       <div style={{
-        width: 400, height: 400, background: 'var(--color-bg-panel)',
+        width: '27.21%', height: '48.13%', background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
-        position: 'absolute', top: 25, right: 25, padding: 14, boxSizing: 'border-box',
+        position: 'absolute', top: '3.01%', right: '1.70%', padding: 14, boxSizing: 'border-box',
         overflowY: 'auto',
       }}>
         <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -982,7 +982,7 @@ useEffect(() => {
                     <div className="muted-text" style={{ fontSize: '0.75rem', color: t.tier_color || 'var(--color-text-muted)' }}>
                       {t.tier_name || `Tier ${t.tier_number}`}
                     </div>
-                    {(t.teams || []).map((team) => (
+                    {(t.teams || []).filter((team) => team.team_name !== teamName).map((team) => (
                       <button
                         key={team.team_id}
                         style={{ display: 'block', width: '100%', textAlign: 'left', background: t.tier_color || 'var(--color-button-bg)', marginTop: 2 }}
@@ -1027,9 +1027,9 @@ useEffect(() => {
 
       {/* Auction / nomination board — top left */}
       <div style={{
-        width: 980, height: 700, background: 'var(--color-bg-panel)',
+        width: '66.67%', height: '84.24%', background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
-        position: 'absolute', top: 25, left: 25, padding: 14, boxSizing: 'border-box',
+        position: 'absolute', top: '3.01%', left: '1.70%', padding: 14, boxSizing: 'border-box',
         overflowY: 'auto',
       }}>
         {!started ? (
@@ -1481,9 +1481,9 @@ useEffect(() => {
 
       {/* Pie chart grid — bottom right */}
       <div style={{
-        width: 400, height: 390, background: 'var(--color-bg-panel)',
+        width: '27.21%', height: '46.93%', background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
-        position: 'absolute', bottom: 50, right: 25, padding: 10, boxSizing: 'border-box',
+        position: 'absolute', bottom: '6.02%', right: '1.70%', padding: 10, boxSizing: 'border-box',
         display: 'flex', flexDirection: 'column', gap: 4,
       }}>
         {(() => {
@@ -1565,9 +1565,9 @@ useEffect(() => {
 
       {/* Undrafted players — bottom left */}
       <div style={{
-        width: 980, height: started ? 330 : 620, background: 'var(--color-bg-panel)',
+        width: '66.67%', height: started ? '39.71%' : '74.61%', background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
-        position: 'absolute', bottom: 25, left: 25, padding: 14, boxSizing: 'border-box',
+        position: 'absolute', bottom: '3.01%', left: '1.70%', padding: 14, boxSizing: 'border-box',
         overflowY: 'auto',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>

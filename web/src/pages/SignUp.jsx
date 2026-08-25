@@ -30,14 +30,7 @@ export default function SignUp({ onNavigate, onSignedUp }) {
     if (!checkErr) setUsernameAvailable(data);
   }
 
-  async function handleGoogle() {
-    setError('');
-    const { error: oauthErr } = await supabase.auth.signInWithOAuth({
-      provider: 'google',
-      options: { redirectTo: window.location.origin },
-    });
-    if (oauthErr) setError(oauthErr.message);
-  }
+
 
   async function handleCreateAccount() {
     setError('');
@@ -101,7 +94,6 @@ export default function SignUp({ onNavigate, onSignedUp }) {
               onChange={(e) => setEmail(e.target.value)}
             />
             <button onClick={handleEmailContinue}>Continue</button>
-            <button onClick={handleGoogle}>Continue with Google</button>
           </>
         )}
 

@@ -237,6 +237,7 @@ export default function Home({ profile, onLogout, onNavigate }) {
   const [fullRankings, setFullRankings] = useState([]);
 
   const [myLeagues, setMyLeagues] = useState([]);
+  const [showLeagueSwitcher, setShowLeagueSwitcher] = useState(false);
   const [activeLeague, setActiveLeague] = useState(null);
   const [showCreateLeague, setShowCreateLeague] = useState(false);
   const [showJoinLeague, setShowJoinLeague] = useState(false);
@@ -1217,21 +1218,77 @@ function minutesUntilAuction() {
       </div>
       <div className="quadrant quadrant-2">
         {!activeLeague ? (
-          <div>
-            <div className="empty-snippet">Current Matchup</div>
-            <div className="empty-snippet">Next Draft Clock</div>
-            <div className="empty-snippet">Cap Situation</div>
-            <div className="empty-snippet">Standings</div>
-            <div style={{ marginTop: 16, display: 'flex', gap: 10 }}>
-              <button onClick={() => setShowCreateLeague(true)}>Create League</button>
-              <button onClick={() => setShowJoinLeague(true)}>Join League</button>
+          <div style={{ position: 'relative' }}>
+
+            <button
+              className="gold-shine-button"
+              onClick={() => setShowCreateLeague(true)}
+              style={{ position: 'absolute', top: 0, right: 0 }}
+            >
+              Create League
+            </button>
+
+            <div style={{ maxWidth: 340 }}>
+              <div className="muted-text" style={{ marginBottom: 10 }}>
+                Already have a league code?
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <input
+                  type="text"
+                  placeholder="Enter league code"
+                  value={joinCode}
+                  onChange={(e) => setJoinCode(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleJoinLeague()}
+                  style={{
+                    flex: '0 1 220px', fontSize: '1.2rem', textAlign: 'center',
+                    padding: '16px 20px', letterSpacing: '2px',
+                  }}
+                />
+                <button onClick={handleJoinLeague} style={{ fontSize: '1rem', padding: '0 28px' }}>
+                  Join
+                </button>
+              </div>
+              {leagueMsg && <div className="error-text" style={{ marginTop: 8 }}>{leagueMsg}</div>}
             </div>
           </div>
         ) : (
           <div>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <button style={{ borderRadius: '20px' }}>{activeLeague.league_name} ▾</button>
+                <div style={{ position: 'relative' }}>
+                  <button style={{ borderRadius: '20px' }} onClick={() => setShowLeagueSwitcher((v) => !v)}>
+                    {activeLeague.league_name} ▾
+                  </button>
+                  {showLeagueSwitcher && (
+                    <>
+                      <div className="click-outside-backdrop" onClick={() => setShowLeagueSwitcher(false)} />
+                      <div className="profile-menu" style={{ left: 0, top: '100%', marginTop: 6, minWidth: 220 }}>
+                        {myLeagues.filter((l) => l.league_id !== activeLeague.league_id).map((l) => (
+                          <button
+                            key={l.league_id}
+                            style={{ display: 'block', width: '100%', textAlign: 'left', marginBottom: 4 }}
+                            onClick={() => { setActiveLeague(l); setShowLeagueSwitcher(false); }}
+                          >
+                            {l.league_name}
+                          </button>
+                        ))}
+                        {myLeagues.length > 1 && <div style={{ borderTop: '1px solid var(--color-border-subtle)', margin: '6px 0' }} />}
+                        <button
+                          style={{ display: 'block', width: '100%', textAlign: 'left', marginBottom: 4 }}
+                          onClick={() => { setShowLeagueSwitcher(false); setShowCreateLeague(true); }}
+                        >
+                          + Create New League
+                        </button>
+                        <button
+                          style={{ display: 'block', width: '100%', textAlign: 'left' }}
+                          onClick={() => { setShowLeagueSwitcher(false); setJoinViaInviteLink(false); setJoinCode(''); setLeagueMsg(''); setShowJoinLeague(true); }}
+                        >
+                          + Join with Code
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
                 <button onClick={() => setShowInviteModal(true)}>Invite Users</button>
                 <button style={{ background: 'rgba(127, 126, 160, 0.62)', color: 'var(--color-text-muted)' }}
                   onClick={() => { setShowLeagueSettings(true); setSettingsSection(null); setGeneralMsg(''); setScoringMsg(''); setAuctionMsg(''); setRosterMsg(''); setLmMsg(''); }}>⚙️</button>

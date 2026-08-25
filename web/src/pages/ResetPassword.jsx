@@ -6,6 +6,7 @@ export default function ResetPassword({ onDone }) {
   const [password2, setPassword2] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [success, setSuccess] = useState(false);
 
   async function handleSetNewPassword() {
     setError('');
@@ -27,7 +28,19 @@ export default function ResetPassword({ onDone }) {
       return;
     }
 
-    onDone();
+    setSuccess(true);
+  }
+
+  if (success) {
+    return (
+      <div className="page">
+        <div className="form-box">
+          <h2>Password Updated</h2>
+          <p className="success-text">Try logging back in with your new password.</p>
+          <button onClick={onDone}>Continue</button>
+        </div>
+      </div>
+    );
   }
 
   return (
