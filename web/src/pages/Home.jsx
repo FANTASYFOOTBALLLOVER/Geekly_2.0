@@ -138,7 +138,7 @@ function contractCostAtWeek(signing, week) {
 function buildPieSlices(segments, size) {
   const nonZero = segments.filter((s) => s.value > 0);
   if (nonZero.length <= 1) {
-    return [{ path: null, color: nonZero.length === 1 ? nonZero[0].color : '#000' }];
+    return [{ path: null, color: nonZero.length === 1 ? nonZero[0].color : '#000', meta: nonZero.length === 1 ? nonZero[0].meta : null }];
   }
   const total = nonZero.reduce((sum, s) => sum + s.value, 0);
   const r = size / 2;
@@ -155,7 +155,7 @@ function buildPieSlices(segments, size) {
     const y2 = r + r * Math.sin(endRad);
     const largeArc = angle > 180 ? 1 : 0;
     const path = `M ${r} ${r} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
-    slices.push({ path, color: seg.color });
+    slices.push({ path, color: seg.color, meta: seg.meta });
     angleStart = angleEnd;
   }
   return slices;
@@ -226,6 +226,8 @@ function ScoringRow({ label, abbr, value, touched, disabled, comingSoon, onChang
 
 export default function Home({ profile, onLogout, onNavigate }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [tooltip, setTooltip] = useState(null);
+  const [mobileActiveTab, setMobileActiveTab] = useState('home'); // 'home' | 'rankings' | 'q3' | 'q4' — mobile-only, ignored on desktop
   const [editingUsername, setEditingUsername] = useState(false);
   const [editingPassword, setEditingPassword] = useState(false);
   const [newUsername, setNewUsername] = useState('');
@@ -661,9 +663,14 @@ function minutesUntilAuction() {
         totalSpent += cost;
       }
     }
-    const segments = Object.entries(byPosition).map(([pos, val]) => ({ value: val, color: POSITION_SLOT_COLORS[pos] || '#888' }));
+    const segments = Object.entries(byPosition).map(([pos, val]) => ({
+      value: val,
+      color: POSITION_SLOT_COLORS[pos] || '#888',
+      meta: [{ name: pos, cost: val }],
+    }));
     const cap = leagueRosterSpec ? Number(leagueRosterSpec.salary_cap) : 300;
-    segments.push({ value: Math.max(0, cap - totalSpent), color: '#000' });
+    const remaining = Math.max(0, cap - totalSpent);
+    segments.push({ value: remaining, color: '#000', meta: [{ name: 'Cap Remaining', cost: remaining }] });
     return segments;
   }
 
@@ -1109,10 +1116,15 @@ function minutesUntilAuction() {
 
   async function handleCreateLeague() {
     setLeagueMsg('');
+    if (newLeagueName.length > 20) {
+      setLeagueMsg('League name must be 20 characters or fewer.');
+      return;
+    }
     const { data, error } = await supabase.rpc('create_league', {
       p_name: newLeagueName,
       p_reception_points: Number(newScoring),
       p_relegation_enabled: newRelegationTiers > 0,
+      p_relegation_tiers: Number(newRelegationTiers) || 1,
       p_num_teams: Number(newNumTeams),
       p_salary_cap: Number(newSalaryCap),
     });
@@ -1175,6 +1187,20 @@ function minutesUntilAuction() {
 
   return (
     <div className="home-grid">
+      {tooltip && (
+        <div
+          style={{
+            position: 'fixed', left: tooltip.x + 12, top: tooltip.y + 12, zIndex: 500,
+            background: 'var(--color-bg-input)', border: '1px solid var(--color-border)',
+            borderRadius: 6, padding: '8px 10px', fontSize: '0.8rem', pointerEvents: 'none',
+            maxWidth: 220,
+          }}
+        >
+          {tooltip.meta.map((m, i) => (
+            <div key={i}>{m.name}: <strong>${m.cost.toFixed(2)}</strong></div>
+          ))}
+        </div>
+      )}
       <div className="grid-header">
         <button onClick={() => setShowFullRankings(false)} style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer' }}>
   <img src={geeklyLogo} alt="Geekly" style={{ height: 62.5 }} />
@@ -1202,7 +1228,7 @@ function minutesUntilAuction() {
         </div>
       </div>
 
-      <div className="quadrant quadrant-1" style={{ cursor: 'pointer' }} onClick={openFullRankings}>
+      <div className={`quadrant quadrant-1 ${mobileActiveTab === 'rankings' ? 'mobile-active' : ''}`} style={{ cursor: 'pointer' }} onClick={openFullRankings}>
         <strong>Rest of Season Rankings</strong>
         <ul className="rankings-list">
           {topRankings.map((r) => (
@@ -1216,7 +1242,7 @@ function minutesUntilAuction() {
         </ul>
         <div className="muted-text" style={{ fontSize: '0.8rem', marginTop: 6 }}>*Click to Expand rankings</div>
       </div>
-      <div className="quadrant quadrant-2">
+      <div className={`quadrant quadrant-2 ${mobileActiveTab === 'home' ? 'mobile-active' : ''}`}>
         {!activeLeague ? (
           <div style={{ position: 'relative' }}>
 
@@ -1339,7 +1365,7 @@ function minutesUntilAuction() {
             <div style={{ display: 'flex', gap: 20, marginTop: 16 }}>
               <div style={{ flex: '0 0 35%' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <div style={editingTeamIdentity ? { border: '2px solid #d4af37', borderRadius: 8, padding: 2, display: 'inline-flex' } : undefined}>
+                  <div style={editingTeamIdentity ? { border: '2px solid #fff', borderRadius: 8, padding: 2, display: 'inline-flex' } : undefined}>
                     <Crest
                       pattern={crestData.pattern}
                       color1={crestData.color1}
@@ -1371,7 +1397,11 @@ function minutesUntilAuction() {
                     </div>
                   )}
                   <button
-                    style={{ padding: '4px 8px', background: 'none', border: 'none' }}
+                    style={{
+                      padding: '4px 8px', background: 'none',
+                      border: editingTeamIdentity ? '2px solid #d4af37' : 'none',
+                      borderRadius: 4,
+                    }}
                     onClick={() => {
                       if (editingTeamIdentity) {
                         handleSaveTeamIdentity();
@@ -1436,8 +1466,16 @@ function minutesUntilAuction() {
                         <svg width="64" height="64" viewBox="0 0 64 64">
                           {slices.map((s, i) =>
                             s.path
-                              ? <path key={i} d={s.path} fill={s.color} stroke="var(--color-border)" strokeWidth="1" />
-                              : <circle key={i} cx="32" cy="32" r="31" fill={s.color} stroke="var(--color-border)" strokeWidth="1" />
+                              ? <path
+                                  key={i} d={s.path} fill={s.color} stroke="var(--color-border)" strokeWidth="1"
+                                  onMouseEnter={(e) => s.meta && setTooltip({ x: e.clientX, y: e.clientY, meta: s.meta })}
+                                  onMouseLeave={() => setTooltip(null)}
+                                />
+                              : <circle
+                                  key={i} cx="32" cy="32" r="31" fill={s.color} stroke="var(--color-border)" strokeWidth="1"
+                                  onMouseEnter={(e) => s.meta && setTooltip({ x: e.clientX, y: e.clientY, meta: s.meta })}
+                                  onMouseLeave={() => setTooltip(null)}
+                                />
                           )}
                         </svg>
                       </div>
@@ -1519,9 +1557,16 @@ function minutesUntilAuction() {
         )}
       </div>
       <div className="bottom-row">
-        <div className="quadrant">Quadrant 3</div>
-        <div className="quadrant">Quadrant 4</div>
+        <div className={`quadrant ${mobileActiveTab === 'q3' ? 'mobile-active' : ''}`}>Coming soon</div>
+        <div className={`quadrant ${mobileActiveTab === 'q4' ? 'mobile-active' : ''}`}>Coming soon</div>
       </div>
+
+      <nav className="mobile-bottom-nav">
+        <button className={mobileActiveTab === 'home' ? 'active' : ''} onClick={() => setMobileActiveTab('home')}>Home</button>
+        <button className={mobileActiveTab === 'rankings' ? 'active' : ''} onClick={() => setMobileActiveTab('rankings')}>Rankings</button>
+        <button className={mobileActiveTab === 'q3' ? 'active' : ''} onClick={() => setMobileActiveTab('q3')}>Coming Soon</button>
+        <button className={mobileActiveTab === 'q4' ? 'active' : ''} onClick={() => setMobileActiveTab('q4')}>Coming Soon</button>
+      </nav>
 
       {showFullRankings && (
         <div className="modal-overlay" onClick={() => setShowFullRankings(false)}>
@@ -1616,6 +1661,7 @@ function minutesUntilAuction() {
                   style={{ flex: 2 }}
                   placeholder="League name"
                   value={newLeagueName}
+                  maxLength={20}
                   onChange={(e) => setNewLeagueName(e.target.value)}
                 />
               </div>
@@ -1856,6 +1902,7 @@ function minutesUntilAuction() {
                   <input
                     type="text"
                     disabled={!activeLeague.is_owner}
+                    maxLength={20}
                     value={generalSettings.name}
                     onChange={(e) => setGeneralSettings({ ...generalSettings, name: e.target.value })}
                   />
@@ -2438,7 +2485,7 @@ function minutesUntilAuction() {
             {settingsSection === 'Relegation' && (
               <div style={{ marginTop: 20 }}>
                 <div className="scoring-subheading">Tier Names & Colors</div>
-                {relegationTiers.slice(0, 3).map((t) => (
+                {relegationTiers.map((t) => (
   <div key={t.tier_number} className="settings-row" style={{ gridTemplateColumns: '1fr 100px 90px 60px' }}>
     <input
       type="text"
