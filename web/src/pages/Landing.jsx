@@ -148,6 +148,8 @@ export default function Landing({ onNavigate, authMode = null }) {
       <header className="landing-header">
         <img src={geeklyLogo} alt="Geekly" className="landing-logo" />
 
+        <p className="mobile-only-notice">This site is built for computer/desktop use and may not display correctly on mobile.</p>
+
         <div className="landing-actions">
           <button className="landing-button landing-button-secondary" onClick={() => onNavigate('login')}>
             Log In

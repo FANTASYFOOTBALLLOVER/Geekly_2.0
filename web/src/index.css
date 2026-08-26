@@ -721,5 +721,18 @@ select {
   width: 40%;
   height: 100%;
   background: linear-gradient(120deg, transparent, rgba(255,255,255,0.75), transparent);
-  animation: goldShineSweep 2.8s ease-in-out infinite;
+  animation: goldShineSweep 2.4s ease-in-out infinite;
+}
+
+.mobile-only-notice {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .mobile-only-notice {
+    display: block;
+    margin-top: 8px;
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+  }
 }
