@@ -297,6 +297,8 @@ export default function Home({ profile, onLogout, onNavigate }) {
   const [confirmingShuffleAll, setConfirmingShuffleAll] = useState(false);
   const [myTierStandings, setMyTierStandings] = useState(null);
   const [teamSignings, setTeamSignings] = useState([]);
+  const [opponentTeam, setOpponentTeam] = useState(null);
+  const [opponentSignings, setOpponentSignings] = useState([]);
   const [leagueRosterSpec, setLeagueRosterSpec] = useState(null);
   const [currentLeagueWeek, setCurrentLeagueWeek] = useState(1);
   const [editingTeamIdentity, setEditingTeamIdentity] = useState(false);
@@ -541,10 +543,46 @@ useEffect(() => {
   }, [activeLeague]);
 
   useEffect(() => {
+    if (!activeLeague || !activeLeague.team_id || !currentLeagueWeek) {
+      setOpponentTeam(null);
+      setOpponentSignings([]);
+      return;
+    }
+    supabase
+      .rpc('get_current_matchup_opponent', {
+        p_team_id: activeLeague.team_id,
+        p_league_id: activeLeague.league_id,
+        p_week: currentLeagueWeek,
+      })
+      .then(({ data, error: oppErr }) => {
+        if (oppErr) { console.error('get_current_matchup_opponent failed:', oppErr); return; }
+        const rows = data || [];
+        if (rows.length === 0) { setOpponentTeam(null); setOpponentSignings([]); return; }
+        setOpponentTeam({
+          team_id: rows[0].opponent_team_id,
+          team_name: rows[0].opponent_team_name,
+          crest_pattern: rows[0].opponent_crest_pattern || 'vertical',
+          crest_color1: rows[0].opponent_crest_color1 || '#888888',
+          crest_color2: rows[0].opponent_crest_color2 || '#ffffff',
+        });
+        setOpponentSignings(rows.filter((r) => r.sleeper_id).map((r) => ({
+          sleeper_id: r.sleeper_id,
+          full_name: r.full_name,
+          player_position: r.player_position,
+          team: r.team,
+          start_week: r.start_week,
+          weeks_requested: r.weeks_requested,
+          base_value: Number(r.base_value),
+          interest_rate_applied: Number(r.interest_rate_applied),
+        })));
+      });
+  }, [activeLeague, currentLeagueWeek]);
+
+  useEffect(() => {
     if (!activeLeague) { setTeamSignings([]); setLeagueRosterSpec(null); return; }
     supabase
       .from('leagues')
-      .select('initial_draft_at, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, salary_cap')
+      .select('initial_draft_at, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, salary_cap')
       .eq('id', activeLeague.league_id)
       .single()
       .then(({ data }) => {
@@ -627,30 +665,37 @@ function minutesUntilAuction() {
     return activeLeague.is_owner ? ': schedule your first one in settings.' : ': not scheduled.';
   }
 
-  function buildRosterSlots() {
+  function buildRosterSlotsFor(signings) {
     if (!leagueRosterSpec) return [];
     const positionCounts = [
       ['QB', leagueRosterSpec.roster_qb], ['RB', leagueRosterSpec.roster_rb],
       ['WR', leagueRosterSpec.roster_wr], ['TE', leagueRosterSpec.roster_te],
       ['FLEX', leagueRosterSpec.roster_flex], ['SFLEX', leagueRosterSpec.roster_superflex],
+      ['BENCH', leagueRosterSpec.roster_bench],
     ];
     const byPosition = { QB: [], RB: [], WR: [], TE: [] };
-    teamSignings.forEach((s) => { if (byPosition[s.player_position]) byPosition[s.player_position].push(s); });
+    signings.forEach((s) => { if (byPosition[s.player_position]) byPosition[s.player_position].push(s); });
     const used = new Set();
     const slots = [];
     for (const [pos, count] of positionCounts) {
-      for (let i = 0; i < count; i++) {
+      for (let i = 0; i < (count || 0); i++) {
         let player = null;
         if (['QB', 'RB', 'WR', 'TE'].includes(pos)) {
           player = byPosition[pos].find((p) => !used.has(p.sleeper_id)) || null;
-        } else {
+        } else if (pos === 'FLEX') {
           player = ['RB', 'WR', 'TE'].flatMap((p) => byPosition[p]).find((p) => !used.has(p.sleeper_id)) || null;
+        } else {
+          player = signings.find((p) => !used.has(p.sleeper_id)) || null;
         }
         if (player) used.add(player.sleeper_id);
         slots.push({ position: pos, player });
       }
     }
     return slots;
+  }
+
+  function buildRosterSlots() {
+    return buildRosterSlotsFor(teamSignings);
   }
 
   function buildWeekCapSegments(week) {
@@ -1282,13 +1327,13 @@ function minutesUntilAuction() {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <div style={{ position: 'relative' }}>
-                  <button style={{ borderRadius: '20px' }} onClick={() => setShowLeagueSwitcher((v) => !v)}>
+                  <button style={{ borderRadius: '16px' }} onClick={() => setShowLeagueSwitcher((v) => !v)}>
                     {activeLeague.league_name} ▾
                   </button>
                   {showLeagueSwitcher && (
                     <>
                       <div className="click-outside-backdrop" onClick={() => setShowLeagueSwitcher(false)} />
-                      <div className="profile-menu" style={{ left: 0, top: '100%', marginTop: 6, minWidth: 220 }}>
+                      <div className="profile-menu" style={{ left: 0, top: '100%', marginTop: 6, minWidth: 220, border: '2px solid var(--color-border)' }}>
                         {myLeagues.filter((l) => l.league_id !== activeLeague.league_id).map((l) => (
                           <button
                             key={l.league_id}
@@ -1315,7 +1360,6 @@ function minutesUntilAuction() {
                     </>
                   )}
                 </div>
-                <button onClick={() => setShowInviteModal(true)}>Invite Users</button>
                 <button style={{ background: 'rgba(127, 126, 160, 0.62)', color: 'var(--color-text-muted)' }}
                   onClick={() => { setShowLeagueSettings(true); setSettingsSection(null); setGeneralMsg(''); setScoringMsg(''); setAuctionMsg(''); setRosterMsg(''); setLmMsg(''); }}>⚙️</button>
               </div>
@@ -1363,42 +1407,11 @@ function minutesUntilAuction() {
             </div>
 
             <div style={{ display: 'flex', gap: 20, marginTop: 16 }}>
-              <div style={{ flex: '0 0 35%' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <div style={editingTeamIdentity ? { border: '2px solid #fff', borderRadius: 8, padding: 2, display: 'inline-flex' } : undefined}>
-                    <Crest
-                      pattern={crestData.pattern}
-                      color1={crestData.color1}
-                      color2={crestData.color2}
-                      size={40}
-                      onClick={editingTeamIdentity ? () => { setShowCrestEditor(true); setCrestMsg(''); } : undefined}
-                      title={editingTeamIdentity ? 'Customize crest' : undefined}
-                    />
-                  </div>
-                  {!editingTeamIdentity ? (
-                    <span style={{ fontWeight: 'bold' }}>
-                      {activeLeague.team_name} ({activeLeague.team_abbr || (profile?.username || '').slice(0, 3).toUpperCase()})
-                    </span>
-                  ) : (
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <input
-                        type="text"
-                        value={editTeamName}
-                        onChange={(e) => setEditTeamName(e.target.value)}
-                        style={{ width: 140 }}
-                      />
-                      <input
-                        type="text"
-                        value={editTeamAbbr}
-                        maxLength={3}
-                        onChange={(e) => setEditTeamAbbr(e.target.value.toUpperCase())}
-                        style={{ width: 50, textAlign: 'center' }}
-                      />
-                    </div>
-                  )}
+              <div style={{ flex: '0 0 68%' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '8% 1fr 6% 7% 6% 1fr 8%', gap: 4, alignItems: 'center' }}>
                   <button
                     style={{
-                      padding: '4px 8px', background: 'none',
+                      padding: '4px 6px', background: 'none', justifySelf: 'start',
                       border: editingTeamIdentity ? '2px solid #d4af37' : 'none',
                       borderRadius: 4,
                     }}
@@ -1413,51 +1426,102 @@ function minutesUntilAuction() {
                       }
                     }}
                   >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <path d="M12 20h9" />
                       <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
                     </svg>
                   </button>
+
+                  {!editingTeamIdentity ? (
+                    <span style={{ fontWeight: 'bold', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block', maxWidth: '100%' }}>{activeLeague.team_name}</span>
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <input type="text" value={editTeamName} onChange={(e) => setEditTeamName(e.target.value)} style={{ width: 110 }} />
+                      <input type="text" value={editTeamAbbr} maxLength={3} onChange={(e) => setEditTeamAbbr(e.target.value.toUpperCase())} style={{ width: 44, textAlign: 'center' }} />
+                    </div>
+                  )}
+
+                  <div style={editingTeamIdentity ? { border: '2px solid #fff', borderRadius: 8, padding: 2, display: 'inline-flex', justifySelf: 'end' } : { justifySelf: 'end' }}>
+                    <Crest
+                      pattern={crestData.pattern}
+                      color1={crestData.color1}
+                      color2={crestData.color2}
+                      size={34}
+                      onClick={editingTeamIdentity ? () => { setShowCrestEditor(true); setCrestMsg(''); } : undefined}
+                      title={editingTeamIdentity ? 'Customize crest' : undefined}
+                    />
+                  </div>
+
+                  <span className="muted-text" style={{ textAlign: 'center', fontSize: '0.75rem', justifySelf: 'center' }}>vs</span>
+
+                  <div style={{ justifySelf: 'start' }}>
+                    {opponentTeam ? (
+                      <Crest pattern={opponentTeam.crest_pattern} color1={opponentTeam.crest_color1} color2={opponentTeam.crest_color2} size={34} />
+                    ) : (
+                      <Crest pattern="solid" color1="#888888" color2="#888888" size={34} />
+                    )}
+                  </div>
+
+                  <span style={{ fontWeight: 'bold', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block', maxWidth: '100%', textAlign: 'right' }}>{opponentTeam ? opponentTeam.team_name : 'No opponent yet'}</span>
+                  <span></span>
                 </div>
                 {teamIdentityMsg && <div className="error-text" style={{ marginTop: 4 }}>{teamIdentityMsg}</div>}
 
-                <div style={{ marginTop: 12 }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: '45px 1fr 40px 45px 90px', gap: 4 }}>
-                    <span></span>
-                    <span className="muted-text" style={{ fontSize: '0.7rem' }}>Player</span>
-                    <span className="muted-text" style={{ fontSize: '0.7rem' }}>Team</span>
-                    <span className="muted-text" style={{ fontSize: '0.7rem' }}>Proj</span>
-                    <span className="muted-text" style={{ fontSize: '0.7rem' }}>Salary / Weeks</span>
-                  </div>
-                  {buildRosterSlots().map((slot, i) => {
-                    const cost = slot.player ? contractCostAtWeek(slot.player, currentLeagueWeek) : null;
-                    return (
-                      <div key={i} style={{ display: 'grid', gridTemplateColumns: '45px 1fr 40px 45px 90px', gap: 4, alignItems: 'center', padding: '4px 0', borderBottom: '1px solid var(--color-border-subtle)' }}>
-                        <span className="roster-slot-badge" style={{ background: POSITION_SLOT_COLORS[slot.position] }}>{slot.position}</span>
-                        <span style={{ fontSize: '0.85rem' }}>{slot.player ? slot.player.full_name : '—'}</span>
-                        <span style={{ fontSize: '0.8rem', fontWeight: 'bold', color: slot.player ? (NFL_TEAM_COLORS[slot.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
-                          {slot.player ? slot.player.team : ''}
-                        </span>
-                        <span className="muted-text" style={{ fontSize: '0.75rem' }}>—</span>
-                        <span style={{ fontSize: '0.8rem' }}>
-                          {slot.player && cost && (
-                            <>
-                              <span style={{ color: 'var(--color-success)', fontWeight: 'bold' }}>${cost.cost.toFixed(2)}</span>
-                              {' / '}{cost.weeksRemaining}
-                            </>
-                          )}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
+                <div style={{ marginTop: 14 }}>
+                  {(() => {
+                    const myRows = buildRosterSlotsFor(teamSignings);
+                    const oppRows = buildRosterSlotsFor(opponentSignings);
+                    const rowCount = Math.min(Math.max(myRows.length, oppRows.length), 9);
 
-              <div style={{ flex: '0 0 35%' }}>
-                <div style={{ display: 'flex', alignItems: 'center', height: 40 }}>
-                  <span style={{ fontWeight: 'bold' }}>Cap Tracker</span>
+                    // Vertical-only sizing: stays full-size through 7 total roster
+                    // slots, shrinks a little at 8 and a little more at 9 — anything
+                    // beyond 9 is simply not rendered at all (rowCount above already
+                    // caps the loop there).
+                    const totalSlots = leagueRosterSpec
+                      ? (Number(leagueRosterSpec.roster_qb) || 0) + (Number(leagueRosterSpec.roster_rb) || 0)
+                        + (Number(leagueRosterSpec.roster_wr) || 0) + (Number(leagueRosterSpec.roster_te) || 0)
+                        + (Number(leagueRosterSpec.roster_flex) || 0) + (Number(leagueRosterSpec.roster_superflex) || 0)
+                        + (Number(leagueRosterSpec.roster_bench) || 0)
+                      : 0;
+                    const shrinkSteps = Math.max(0, Math.min(totalSlots, 9) - 7);
+                    const rowVerticalPadding = Math.max(5 - shrinkSteps * 1.5, 2);
+
+                    return Array.from({ length: rowCount }, (_, i) => {
+                      const mine = myRows[i];
+                      const opp = oppRows[i];
+                      const myCost = mine?.player ? contractCostAtWeek(mine.player, currentLeagueWeek) : null;
+                      const oppCost = opp?.player ? contractCostAtWeek(opp.player, currentLeagueWeek) : null;
+                      const position = mine?.position || opp?.position;
+                      return (
+                        <div key={i} style={{ display: 'grid', gridTemplateColumns: '8% 1fr 6% 7% 6% 1fr 8%', gap: 4, alignItems: 'center', padding: `${rowVerticalPadding}px 0`, borderBottom: '1px solid var(--color-border-subtle)', fontSize: '0.85rem' }}>
+                          <span className="muted-text" style={{ fontSize: '0.7rem' }}>
+                            {mine?.player && myCost ? <>${myCost.cost.toFixed(0)}/{myCost.weeksRemaining}</> : ''}
+                          </span>
+                          <span style={{ color: mine?.player ? (NFL_TEAM_COLORS[mine.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
+                            {mine?.player ? mine.player.full_name : '—'}
+                          </span>
+                          <span className="muted-text" style={{ textAlign: 'right', fontSize: '0.75rem' }}>—</span>
+                          <span className="roster-slot-badge" style={{ background: POSITION_SLOT_COLORS[position], textAlign: 'center', justifySelf: 'center' }}>{position}</span>
+                          <span className="muted-text" style={{ fontSize: '0.75rem' }}>—</span>
+                          <span style={{ textAlign: 'right', color: opp?.player ? (NFL_TEAM_COLORS[opp.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
+                            {opp?.player ? opp.player.full_name : '—'}
+                          </span>
+                          <span className="muted-text" style={{ textAlign: 'right', fontSize: '0.7rem' }}>
+                            {opp?.player && oppCost ? <>${oppCost.cost.toFixed(0)}/{oppCost.weeksRemaining}</> : ''}
+                          </span>
+                        </div>
+                      );
+                    });
+                  })()}
+
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 7% 1fr', marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--color-border-subtle)', fontSize: '0.85rem' }}>
+                    <span style={{ textAlign: 'right', paddingRight: 8 }}>—</span>
+                    <span></span>
+                    <span style={{ textAlign: 'left', paddingLeft: 8 }}>—</span>
+                  </div>
                 </div>
-                <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12 }}>
+
+                <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-start', gap: 26 }}>
                   {Array.from({ length: 6 }, (_, i) => currentLeagueWeek + i).map((week) => {
                     const slices = buildPieSlices(buildWeekCapSegments(week), 64);
                     return (
@@ -1489,9 +1553,18 @@ function minutesUntilAuction() {
                   <div>
                     <div
                       className="tier-header"
-                      style={{ background: tierDisplayColor(myTierStandings.tier_number, myTierStandings.tier_color) }}
+                      style={{ background: tierDisplayColor(myTierStandings.tier_number, myTierStandings.tier_color), textAlign: 'left', marginTop: 0, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
                     >
-                      {myTierStandings.tier_name || `Tier ${myTierStandings.tier_number}`}
+                      <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {myTierStandings.tier_name || `Tier ${myTierStandings.tier_number}`}
+                      </span>
+                      <button
+                        className="black-shine-button"
+                        style={{padding: '5px 24px', fontSize: '0.8rem', color: '#fcfafa' }}
+                        onClick={() => setShowInviteModal(true)}
+                      >
+                        Invite Users
+                      </button>
                     </div>
                     <table className="tier-standings-table tier-standings-table-compact">
                       <thead>
@@ -1536,8 +1609,8 @@ function minutesUntilAuction() {
                                   <Crest pattern="solid" color1="none" color2="none" size={20} empty />
                                 )}
                               </td>
-                              <td>
-                                <span className={cellClass} style={isMyTeam ? { fontWeight: 'bold' } : undefined}>
+                              <td style={{ maxWidth: 120 }}>
+                                <span className={cellClass} style={{ ...(isMyTeam ? { fontWeight: 'bold' } : {}), display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                                   {t.team_name}
                                 </span>
                               </td>

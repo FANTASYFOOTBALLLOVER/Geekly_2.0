@@ -46,37 +46,29 @@ export default function Login({ onNavigate, onLoggedIn }) {
     if (oauthErr) setError(oauthErr.message);
   }
 
-  async function handleForgotPassword() {
-    setError('');
-    const trimmed = identifier.trim();
+async function handleForgotPassword() {
+  setError('');
+  const trimmed = identifier.trim();
 
-    if (!trimmed) {
-      setError('Please type an email into the email box to reset password.');
-      return;
-    }
+  if (!trimmed) {
+    setError('Please type an email into the email box to reset password.');
+    return;
+  }
 
-    // This action specifically requires a real email — a username (or any
-    // string without an @) can never be a match, so don't even bother
-    // round-tripping to the server for that case.
-    if (!trimmed.includes('@')) {
-      setError('That email is not associated with an account.');
-      return;
-    }
-
+  if (trimmed.includes('@')) {
     const { data: resolvedEmail } = await supabase.rpc('get_email_for_login', {
       p_identifier: trimmed,
     });
 
-    if (!resolvedEmail || resolvedEmail.toLowerCase() !== trimmed.toLowerCase()) {
-      setError('That email is not associated with an account.');
-      return;
+    if (resolvedEmail && resolvedEmail.toLowerCase() === trimmed.toLowerCase()) {
+      await supabase.auth.resetPasswordForEmail(resolvedEmail, {
+        redirectTo: 'https://geeklyfantasy.com',
+      });
     }
-
-    await supabase.auth.resetPasswordForEmail(resolvedEmail, {
-  redirectTo: 'https://geeklyfantasy.com',
-});
-    setShowResetSentPopup(true);
   }
+
+  setShowResetSentPopup(true);
+}
 
   return (
     <div className="page">

@@ -694,7 +694,44 @@ select {
   0% { transform: translateX(-150%) skewX(-20deg); }
   100% { transform: translateX(250%) skewX(-20deg); }
 }
+.black-shine-button {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(135deg, #989494, #565656, #111);
+  color: #fcfafa;
+  font-weight: bold;
+  border: none;
+  border-radius: 8px;
+  padding: 16px 36px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
 
+.black-shine-button::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 35%;
+  height: 100%;
+  background: linear-gradient(120deg, transparent, rgba(255,255,255,0.35), transparent);
+  animation: blackShineSweep 2.8s ease-in-out infinite;
+}
+
+.black-shine-button:hover {
+  background: linear-gradient(135deg, #b0adad, #6e6e6e, #1a1a1a);
+  box-shadow: 0 0 14px rgba(255,255,255,0.25);
+}
+
+.black-shine-button:hover::after {
+  animation-duration: 1.1s;
+}
+
+@keyframes blackShineSweep {
+  0% { transform: translateX(-150%) skewX(-20deg); }
+  100% { transform: translateX(350%) skewX(-20deg); }
+}
 .gold-shine-button {
   position: relative;
   overflow: hidden;
@@ -702,8 +739,8 @@ select {
   color: #111;
   font-weight: bold;
   border: none;
-  border-radius: 20px;
-  padding: 16px 36px;
+  border-radius: 10px;
+  padding: 0px 4px;
   font-size: 1.1rem;
   cursor: pointer;
 }
