@@ -26,6 +26,9 @@ const POSITION_ROW_TINT = {
 
 const MAX_CONTRACT_WEEKS = 18; // no real "max contract length" setting exists yet — hardcoded per spec
 const NOMINATION_SECONDS = 20;
+const AUTO_START_RETRY_MS = 10000;
+const END_CHECK_RETRY_MS = 10000;
+const MIN_BID = 1; // a team with less than this left for the week can't sign anyone else
 const CPU_NOMINATE_DELAY_MS = 1000;
 const WINNERS_DISPLAY_MS = 2000;
 
@@ -63,6 +66,85 @@ function Crest({ pattern, color1, color2, size = 28, onClick }) {
       </g>
       <path d={SHIELD_PATH} fill="none" stroke="var(--color-border)" strokeWidth="3" />
     </svg>
+  );
+}
+
+const STEPPER_BUTTON_STYLE = {
+  width: 22, height: 22, padding: 0, borderRadius: '50%', lineHeight: 1,
+  background: 'var(--color-button-bg)', border: '1px solid var(--color-border)',
+  color: 'var(--color-text)', fontWeight: 'bold', flex: '0 0 auto',
+};
+
+// Bidding without having to type: the amount defaults to the smallest bid that
+// would take the lead, +/- nudge it a dollar or a week at a time, and the
+// button says what it will actually cost. The number fields still accept
+// typing for anyone who'd rather jump straight to a figure.
+function BidControls({
+  amountValue, weeksValue, highBid, capMax, isLeading, statSize, compact,
+  onAmountChange, onWeeksChange, onSubmit,
+}) {
+  const minimumBid = highBid + MIN_BID;
+  const nextBid = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+  const weeks = Number(weeksValue) > 0 ? Number(weeksValue) : 1;
+  const canBid = !isLeading && nextBid > highBid && nextBid <= capMax;
+
+  const nudgeAmount = (delta) => {
+    const base = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+    onAmountChange(String(Math.max(0, Math.min(capMax, base + delta))));
+  };
+  const nudgeWeeks = (delta) => {
+    onWeeksChange(String(Math.max(1, Math.min(MAX_CONTRACT_WEEKS, weeks + delta))));
+  };
+
+  const row = { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 };
+
+  return (
+    <div style={{ width: '100%' }}>
+      <div style={{ ...row, marginTop: 8 }}>
+        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
+        <span>$</span>
+        <input
+          type="number"
+          disabled={isLeading}
+          value={amountValue}
+          placeholder={String(minimumBid)}
+          onChange={(e) => {
+            const raw = e.target.value;
+            onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
+          }}
+          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+          style={{ width: compact ? 50 : 62, padding: '2px 4px', textAlign: 'center' }}
+        />
+        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
+      </div>
+
+      <div style={{ ...row, marginTop: 6 }}>
+        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
+        <input
+          type="number"
+          disabled={isLeading}
+          value={weeksValue}
+          placeholder="1"
+          onChange={(e) => onWeeksChange(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+          style={{ width: compact ? 40 : 48, padding: '2px 4px', textAlign: 'center' }}
+        />
+        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
+        <span style={{ fontSize: statSize, color: '#fff' }}>{weeks === 1 ? 'week' : 'weeks'}</span>
+      </div>
+
+      <button
+        disabled={!canBid}
+        onClick={() => onSubmit(nextBid, weeks)}
+        style={{
+          marginTop: 8, width: '100%', border: '3px solid white',
+          background: isLeading ? 'var(--color-success)' : 'var(--color-button-bg)',
+          color: isLeading ? '#111' : 'var(--color-text)', fontWeight: 'bold',
+        }}
+      >
+        {isLeading ? 'Leading' : `Bid $${nextBid}`}
+      </button>
+    </div>
   );
 }
 
@@ -284,6 +366,8 @@ export default function DraftRoom({ league, profile, onBack }) {
   const [rankedPlayers, setRankedPlayers] = useState([]);
   const [wonPlayers, setWonPlayers] = useState([]);
   const [allWonPlayers, setAllWonPlayers] = useState([]);
+  const [signingsLoaded, setSigningsLoaded] = useState(false);
+  const [leagueTeams, setLeagueTeams] = useState([]);
   const [viewingTeamName, setViewingTeamName] = useState(null);
   const [crestData, setCrestData] = useState({ pattern: 'vertical', color1: '#888888', color2: '#ffffff' });
   const [teamName, setTeamName] = useState('My Team');
@@ -312,6 +396,8 @@ export default function DraftRoom({ league, profile, onBack }) {
   const [flippedKeys, setFlippedKeys] = useState(() => new Set());
   const [flashUntilByKey, setFlashUntilByKey] = useState({});
   const prevAuctionSlotsRef = useRef([]);
+  const nextAutoStartAttemptRef = useRef(0);
+  const nextEndCheckAttemptRef = useRef(0);
 
   const rankedPlayersRef = useRef(rankedPlayers);
   rankedPlayersRef.current = rankedPlayers;
@@ -357,6 +443,44 @@ export default function DraftRoom({ league, profile, onBack }) {
           setCurrentWeek(getCurrentLeagueWeek(data.initial_draft_at, new Date()));
         }
       });
+  }, [league]);
+
+  // Every team in this league, paired with its owner's crest. Both tables are
+  // publicly readable, so this is the one fetch that lets the board show whose
+  // shield is actually on a nomination, a bid, or a won player — previously
+  // every team but your own fell back to an anonymous grey shield.
+  useEffect(() => {
+    if (!league) return;
+    let cancelled = false;
+    supabase
+      .from('teams')
+      .select('id, team_name, owner_id')
+      .eq('league_id', league.league_id)
+      .then(({ data: teamRows, error: teamsErr }) => {
+        if (cancelled) return;
+        if (teamsErr) { console.error('team crest fetch failed:', teamsErr); return; }
+        const rows = teamRows || [];
+        const ownerIds = rows.map((t) => t.owner_id).filter(Boolean);
+        if (ownerIds.length === 0) { setLeagueTeams(rows.map((t) => ({ ...t, crest: null }))); return; }
+        supabase
+          .from('profiles')
+          .select('id, crest_pattern, crest_color1, crest_color2')
+          .in('id', ownerIds)
+          .then(({ data: profileRows, error: profErr }) => {
+            if (cancelled) return;
+            if (profErr) { console.error('crest profile fetch failed:', profErr); }
+            const crestByOwner = {};
+            (profileRows || []).forEach((p) => {
+              crestByOwner[p.id] = {
+                pattern: p.crest_pattern || 'vertical',
+                color1: p.crest_color1 || '#888888',
+                color2: p.crest_color2 || '#ffffff',
+              };
+            });
+            setLeagueTeams(rows.map((t) => ({ ...t, crest: crestByOwner[t.owner_id] || null })));
+          });
+      });
+    return () => { cancelled = true; };
   }, [league]);
 
   // Ticking clock drives countdown displays and all phase resolution
@@ -462,12 +586,34 @@ useEffect(() => {
   }
 
   async function beginNominationRound() {
-    await supabase.rpc('start_draft_session', { p_league_id: league.league_id });
+    const { error: startErr } = await supabase.rpc('start_draft_session', { p_league_id: league.league_id });
+    if (startErr) {
+      console.error('start_draft_session failed:', startErr);
+      setError(`Could not start the auction: ${startErr.message}`);
+      return false;
+    }
+    setError('');
+    return true;
   }
 
   function myPendingNominationSlot() {
     if (phase !== 'nomination') return null;
     return nominationSlots.find((s) => s.isMe && !s.player) || null;
+  }
+
+  // Resolves whichever team a card belongs to into the crest that should fly
+  // on it. Falls back to the anonymous grey shield only when the team really
+  // is unknown (someone who hasn't picked a crest, or a card with no team yet).
+  function crestFor(teamId, fallbackTeamName) {
+    const hasId = teamId !== null && teamId !== undefined;
+    if ((hasId && Number(teamId) === Number(league?.team_id)) || (!hasId && fallbackTeamName === teamName)) {
+      return { pattern: crestData.pattern, color1: crestData.color1, color2: crestData.color2 };
+    }
+    const match =
+      (hasId && leagueTeams.find((t) => Number(t.id) === Number(teamId))) ||
+      (fallbackTeamName && leagueTeams.find((t) => t.team_name === fallbackTeamName));
+    if (match && match.crest) return match.crest;
+    return { pattern: 'solid', color1: '#888888', color2: '#888888' };
   }
 
   function statsRowFor(player, view) {
@@ -543,12 +689,13 @@ useEffect(() => {
     setHiddenWeeks((prev) => prev.slice(0, -1));
   }
 
-  async function submitBid(key) {
+  async function submitBid(key, amountOverride, weeksOverride) {
     const s = slots.find((row) => row.key === key);
     if (!s || s.completed) return;
     if (s.highBidder === 'me') return; // already leading — locked until outbid
-    const amount = Number(s.myBidAmount);
-    const weeksEntered = Number(s.myWeeks) > 0 ? Number(s.myWeeks) : 1;
+    const amount = Number(amountOverride ?? s.myBidAmount);
+    const rawWeeks = Number(weeksOverride ?? s.myWeeks);
+    const weeksEntered = rawWeeks > 0 ? rawWeeks : 1;
     if (!amount || amount <= s.highBid) return;
 
     const violatedWeeks = [];
@@ -715,6 +862,7 @@ useEffect(() => {
     player: s.player,
     highBid: Number(s.highBid),
     highBidder: Number(s.highBidderTeamId) === league?.team_id ? 'me' : 'bot',
+    highBidderTeamId: s.highBidderTeamId,
     highBidderTeamName: s.highBidderTeamName,
     committedWeeks: Number(s.myWeeks) || 1,
     myBidAmount: myBidInputs[s.key] ?? '',
@@ -727,6 +875,7 @@ useEffect(() => {
 
   const winnersDisplay = (session?.winners_display || []).map((s) => ({
     player: s.player,
+    teamId: s.highBidderTeamId,
     teamName: s.highBidderTeamName,
     isMe: Number(s.highBidderTeamId) === league?.team_id,
     amount: Number(s.highBid),
@@ -751,27 +900,42 @@ useEffect(() => {
   }, [session?.auction_slots]);
 
   // Roster data is the real, authoritative source of truth (the signings
-  // table), not a client-side accumulation of transient realtime snapshots —
-  // refetch it every time a round actually finishes, so both my own roster
-  // and every other team's roster stay correct all the way through the draft,
-  // not just once at the very end.
-  useEffect(() => {
-    if (!league || phase !== 'winners') return;
-    supabase.rpc('get_league_signings', { p_league_id: league.league_id, p_season: 2026 }).then(({ data, error: sigErr }) => {
-      if (sigErr) { console.error('get_league_signings failed:', sigErr); return; }
-      const rows = data || [];
-      const toEntry = (row) => ({
-        teamName: row.team_name,
-        isMe: row.team_id === league.team_id,
-        player: { sleeper_id: row.sleeper_id, full_name: row.full_name, player_position: row.player_position, team: row.team },
-        startWeek: row.start_week,
-        weeksRequested: row.weeks_requested,
-        baseValue: Number(row.base_value),
-      });
-      setAllWonPlayers(rows.map(toEntry));
-      setWonPlayers(rows.filter((row) => row.team_id === league.team_id).map(toEntry));
+  // table), not a client-side accumulation of transient realtime snapshots.
+  async function loadSignings() {
+    if (!league) return;
+    const { data, error: sigErr } = await supabase.rpc('get_league_signings', {
+      p_league_id: league.league_id, p_season: 2026,
     });
-  }, [league, phase]);
+    if (sigErr) { console.error('get_league_signings failed:', sigErr); return; }
+    const rows = (data || []).filter((row) => row.sleeper_id);
+    const toEntry = (row) => ({
+      teamId: row.team_id,
+      teamName: row.team_name,
+      isMe: row.team_id === league.team_id,
+      player: { sleeper_id: row.sleeper_id, full_name: row.full_name, player_position: row.player_position, team: row.team },
+      startWeek: row.start_week,
+      weeksRequested: row.weeks_requested,
+      baseValue: Number(row.base_value),
+    });
+    setAllWonPlayers(rows.map(toEntry));
+    setWonPlayers(rows.filter((row) => row.team_id === league.team_id).map(toEntry));
+    setSigningsLoaded(true);
+  }
+
+  // Load rosters as soon as the room opens, so leaving and coming back
+  // mid-draft shows every contract already signed rather than an empty
+  // roster panel, and refetch every time a round finishes so both my own
+  // roster and every other team's stay correct all the way through.
+  useEffect(() => {
+    loadSignings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [league]);
+
+  useEffect(() => {
+    if (phase !== 'winners') return;
+    loadSignings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
 
   useEffect(() => {
     if (phase !== 'auction' || playersPerAuction !== 1 || slots.length === 0) return;
@@ -785,6 +949,45 @@ useEffect(() => {
 
   const gridCols = computeGridColumns(playersPerAuction);
   const weekNumbers = Array.from({ length: MAX_CONTRACT_WEEKS }, (_, i) => currentWeek + i);
+
+  const rosterSize = leagueRosterSpec
+    ? ['roster_qb', 'roster_rb', 'roster_wr', 'roster_te', 'roster_flex', 'roster_superflex', 'roster_bench']
+        .reduce((sum, field) => sum + (Number(leagueRosterSpec[field]) || 0), 0)
+    : 0;
+
+  // A team is out of the auction once it has no roster spot left to fill, or
+  // has too little cap left this week to sign anyone at all.
+  function teamIsDone(team) {
+    const picks = allWonPlayers.filter((w) => Number(w.teamId) === Number(team.id));
+    if (picks.length >= rosterSize) return true;
+    const spentThisWeek = picks.reduce(
+      (sum, w) => sum + costAtWeekWithBye(w.baseValue, w.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[w.player.team]),
+      0
+    );
+    return salaryCap - spentThisWeek < MIN_BID;
+  }
+
+  const everyTeamIsDone =
+    signingsLoaded && rosterSize > 0 && leagueTeams.length > 0 && leagueTeams.every(teamIsDone);
+
+  // Close the draft out once there is nothing left for anyone to do. Whichever
+  // browser notices first tells the server, and the resulting phase change
+  // reaches everyone else over the same realtime channel as any other update.
+  useEffect(() => {
+    if (!league || !session) return;
+    if (session.phase === 'pending' || session.phase === 'ended') return;
+    if (!everyTeamIsDone) return;
+    const now = Date.now();
+    if (now < nextEndCheckAttemptRef.current) return;
+    nextEndCheckAttemptRef.current = now + END_CHECK_RETRY_MS;
+    supabase.rpc('draft_end_session', { p_league_id: league.league_id }).then(({ error: endErr }) => {
+      if (endErr) {
+        console.error('draft_end_session failed:', endErr);
+        setError(`Every team is full or out of cap room, but the draft could not be closed out: ${endErr.message}`);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [league, session?.phase, everyTeamIsDone]);
 
 
   const availablePositions = leagueRosterSpec
@@ -816,13 +1019,21 @@ useEffect(() => {
     return null;
   })();
 
+  // Auto-start: the moment the scheduled kickoff passes (or immediately, for a
+  // league with no schedule set), the first browser in the room starts the
+  // auction for everyone. Gated on the shared session actually having loaded —
+  // before it arrives `phase` merely *defaults* to 'pending', and starting off
+  // that default would restart a draft that is already underway. Throttled so a
+  // failing start retries every 10s instead of firing once a second.
   useEffect(() => {
-    if (started) return;
+    if (!session || session.phase !== 'pending') return;
     if (!scheduleLoaded || !draftPoolLoaded) return;
     if (auctionTarget && auctionTarget.getTime() > tick) return;
+    if (tick < nextAutoStartAttemptRef.current) return;
+    nextAutoStartAttemptRef.current = tick + AUTO_START_RETRY_MS;
     beginNominationRound();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, started, scheduleLoaded, draftPoolLoaded]);
+  }, [tick, session, scheduleLoaded, draftPoolLoaded]);
 
   const nominationSecondsLeft = nominationTimerEndsAt ? Math.max(0, Math.round((nominationTimerEndsAt - tick) / 1000)) : NOMINATION_SECONDS;
 
@@ -935,11 +1146,7 @@ useEffect(() => {
             style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}
             onClick={() => setShowTeamDropdown((v) => !v)}
           >
-            {(viewingTeamName === null || viewingTeamName === teamName) ? (
-              <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={36} />
-            ) : (
-              <Crest pattern="solid" color1="#888888" color2="#888888" size={36} />
-            )}
+            <Crest {...crestFor(null, viewingTeamName || teamName)} size={36} />
             <span style={{ fontWeight: 'bold' }}>{viewingTeamName || teamName} ▾</span>
           </div>
           <div style={{ display: 'flex', gap: 6 }}>
@@ -985,9 +1192,13 @@ useEffect(() => {
                     {(t.teams || []).filter((team) => team.team_name !== teamName).map((team) => (
                       <button
                         key={team.team_id}
-                        style={{ display: 'block', width: '100%', textAlign: 'left', background: t.tier_color || 'var(--color-button-bg)', marginTop: 2 }}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left',
+                          background: t.tier_color || 'var(--color-button-bg)', marginTop: 2,
+                        }}
                         onClick={() => { setViewingTeamName(team.team_name === teamName ? null : team.team_name); setShowTeamDropdown(false); }}
                       >
+                        <Crest {...crestFor(team.team_id, team.team_name)} size={18} />
                         {team.team_name}
                       </button>
                     ))}
@@ -1046,11 +1257,7 @@ useEffect(() => {
                 </div>
                 {teamTurnOrder.length > 0 && (
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 16 }}>
-                    {teamTurnOrder[0].name === (league?.team_name || 'My Team') ? (
-                      <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={28} />
-                    ) : (
-                      <Crest pattern="solid" color1="#888888" color2="#888888" size={28} />
-                    )}
+                    <Crest {...crestFor(teamTurnOrder[0].teamId, teamTurnOrder[0].name)} size={28} />
                     <span style={{ color: 'var(--color-error)', fontWeight: 'bold' }}>
                       {teamTurnOrder[0].name} will be up first
                     </span>
@@ -1060,6 +1267,22 @@ useEffect(() => {
             ) : (
               <div className="muted-text" style={{ marginTop: 8 }}>
                 No auction is scheduled for this league yet.
+              </div>
+            )}
+            {league?.is_owner && (
+              <div style={{ marginTop: 20 }}>
+                <button
+                  onClick={() => { nextAutoStartAttemptRef.current = 0; beginNominationRound(); }}
+                  style={{
+                    background: 'var(--color-success)', color: '#111', fontWeight: 'bold',
+                    padding: '10px 24px', borderRadius: 8, border: 'none',
+                  }}
+                >
+                  Start Auction Now
+                </button>
+                <div className="settings-note" style={{ marginTop: 6 }}>
+                  The auction starts on its own at the scheduled time — this is just an override.
+                </div>
               </div>
             )}
           </div>
@@ -1115,17 +1338,13 @@ useEffect(() => {
       <div>Wk {currentWeek + 2}: —</div>
     </div>
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
-      {s.isMe ? (
-        <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={22} />
-      ) : (
-        <Crest pattern="solid" color1="#fefefe" color2="#10ae3d" size={22} />
-      )}
+      <Crest {...crestFor(s.teamId, s.teamName)} size={22} />
       <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.teamName}</span>
     </div>
   </>
 ) : (
                   <>
-                    <Crest pattern="solid" color1="#888888" color2="#888888" size={50} />
+                    <Crest {...crestFor(s.teamId, s.teamName)} size={50} />
                     <div style={{ fontWeight: 'bold', marginTop: 8 }}>{s.teamName}</div>
                     <div className="muted-text" style={{ fontSize: '0.75rem' }}>{s.isMe ? 'Your pick' : 'choosing...'}</div>
                   </>
@@ -1155,11 +1374,7 @@ useEffect(() => {
                 />
                 <div style={{ fontWeight: 'bold', marginTop: 8 }}>{w.player.full_name}</div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }}>
-                  {w.isMe ? (
-                    <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={32} />
-                  ) : (
-                    <Crest pattern="solid" color1="#888888" color2="#888888" size={32} />
-                  )}
+                  <Crest {...crestFor(w.teamId, w.teamName)} size={32} />
                   <span className="muted-text" style={{ fontSize: '0.85rem' }}>{w.teamName}</span>
                 </div>
                 <div style={{ color: 'var(--color-success)', fontWeight: 'bold', marginTop: 8 }}>${w.amount}</div>
@@ -1188,11 +1403,7 @@ useEffect(() => {
                       filter: 'grayscale(0.6) brightness(0.7)',
                     }}
                   >
-                    {isMyBid ? (
-                      <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={sizing.imgSize * 0.4} />
-                    ) : (
-                      <Crest pattern="solid" color1="#888888" color2="#888888" size={sizing.imgSize * 0.4} />
-                    )}
+                    <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={sizing.imgSize * 0.4} />
                     <div style={{ fontWeight: 'bold', marginTop: 6 }}>{s.highBidderTeamName}</div>
                     <div className="muted-text" style={{ fontSize: sizing.statSize }}>{s.player.full_name}</div>
                     <div style={{ color: 'var(--color-success)', fontWeight: 'bold', marginTop: 4 }}>${s.highBid}</div>
@@ -1225,46 +1436,24 @@ useEffect(() => {
                         </div>
 
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 12 }}>
-                          {isMyBid ? (
-                            <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={40} />
-                          ) : (
-                            <Crest pattern="solid" color1="#888888" color2="#888888" size={40} />
-                          )}
+                          <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={40} />
                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+                          {s.highBidderTeamName && (
+                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.highBidderTeamName}</span>
+                          )}
                         </div>
 
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
-                          <span>$</span>
-                          <input
-                            type="number"
-                            disabled={isMyBid}
-                            value={s.myBidAmount}
-                            onChange={(e) => {
-                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
-                              const raw = e.target.value;
-                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
-                              updateSlotBidAmount(s.key, clamped);
-                            }}
-                            style={{ width: 54 }}
-                          />
-                          <span>/</span>
-                          <input
-                            type="number"
-                            disabled={isMyBid}
-                            value={s.myWeeks}
-                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
-                            style={{ width: 44 }}
-                          />
-                          <span style={{ color: '#fff' }}>weeks</span>
-                        </div>
-
-                        <button
-                          disabled={!(Number(s.myBidAmount) > s.highBid)}
-                          onClick={() => submitBid(s.key)}
-                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
-                        >
-                          Submit Bid
-                        </button>
+                        <BidControls
+                          amountValue={s.myBidAmount}
+                          weeksValue={s.myWeeks}
+                          highBid={s.highBid}
+                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+                          isLeading={isMyBid}
+                          statSize="0.85rem"
+                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+                        />
 
                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
                       </div>
@@ -1427,47 +1616,26 @@ useEffect(() => {
                     </div>
                   )}
 
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8 }}>
-                    {isMyBid ? (
-                      <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={34} />
-                    ) : (
-                      <Crest pattern="solid" color1="#888888" color2="#888888" size={34} />
-                    )}
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8 }}
+                    title={s.highBidderTeamName ? `Leading bid: ${s.highBidderTeamName}` : 'No bids yet'}
+                  >
+                    <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={34} />
                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
                   </div>
 
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
-                    <span>$</span>
-                    <input
-                      type="number"
-                      disabled={isMyBid}
-                      value={s.myBidAmount}
-                      onChange={(e) => {
-                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
-                        const raw = e.target.value;
-                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
-                        updateSlotBidAmount(s.key, clamped);
-                      }}
-                      style={{ width: 44, padding: '2px 4px' }}
-                    />
-                    <span>/</span>
-                    <input
-                      type="number"
-                      disabled={isMyBid}
-                      value={s.myWeeks}
-                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
-                      style={{ width: 36, padding: '2px 4px' }}
-                    />
-                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
-                  </div>
-
-                  <button
-                    disabled={!(Number(s.myBidAmount) > s.highBid)}
-                    onClick={() => submitBid(s.key)}
-                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
-                  >
-                    Submit Bid
-                  </button>
+                  <BidControls
+                    compact
+                    amountValue={s.myBidAmount}
+                    weeksValue={s.myWeeks}
+                    highBid={s.highBid}
+                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+                    isLeading={isMyBid}
+                    statSize={sizing.statSize}
+                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+                  />
 
             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
                 </div>
