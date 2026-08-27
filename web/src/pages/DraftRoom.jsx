@@ -100,7 +100,7 @@ function BidControls({
 
   return (
     <div style={{ width: '100%' }}>
-      <div style={{ ...row, marginTop: 8 }}>
+      <div style={{ ...row, marginTop: 8, flexWrap: 'wrap', columnGap: 3 }}>
         <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
         <span>$</span>
         <input
@@ -113,12 +113,12 @@ function BidControls({
             onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
           }}
           onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
-          style={{ width: compact ? 50 : 62, padding: '2px 4px', textAlign: 'center' }}
+          style={{ width: compact ? 46 : 62, padding: '2px 4px', textAlign: 'center' }}
         />
         <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
-      </div>
 
-      <div style={{ ...row, marginTop: 6 }}>
+        <span style={{ width: 6, flex: '0 0 auto' }} />
+
         <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
         <input
           type="number"
@@ -127,10 +127,12 @@ function BidControls({
           placeholder="1"
           onChange={(e) => onWeeksChange(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
-          style={{ width: compact ? 40 : 48, padding: '2px 4px', textAlign: 'center' }}
+          style={{ width: compact ? 36 : 48, padding: '2px 4px', textAlign: 'center' }}
         />
         <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
-        <span style={{ fontSize: statSize, color: '#fff' }}>{weeks === 1 ? 'week' : 'weeks'}</span>
+        <span style={{ fontSize: statSize, color: '#fff' }}>
+          {compact ? (weeks === 1 ? 'wk' : 'wks') : (weeks === 1 ? 'week' : 'weeks')}
+        </span>
       </div>
 
       <button
