@@ -1,0 +1,381 @@
+diff --git a/web/src/draftControls.jsx b/web/src/draftControls.jsx
+index ed8f30a..061dc22 100644
+--- a/web/src/draftControls.jsx
++++ b/web/src/draftControls.jsx
+@@ -1,91 +1,10 @@
+ // Pieces shared by the live Draft Room and the Mock Draft. Both screens run
+-// the same auction UI, so anything that governs how a bid is entered or how a
+-// week's fixture is written belongs here rather than being copied into each.
++// the same auction board, so anything that governs how a week's fixture is
++// written belongs here rather than being copied into each.
+ 
+ export const MAX_CONTRACT_WEEKS = 18; // no real "max contract length" setting exists yet — hardcoded per spec
+ export const MIN_BID = 1; // a team with less than this left for the week can't sign anyone else
+ 
+-export const STEPPER_BUTTON_STYLE = {
+-  width: 22, height: 22, padding: 0, borderRadius: '50%', lineHeight: 1,
+-  background: 'var(--color-button-bg)', border: '1px solid var(--color-border)',
+-  color: 'var(--color-text)', fontWeight: 'bold', flex: '0 0 auto',
+-};
+-
+-// Bidding without having to type: the amount defaults to the smallest bid that
+-// would take the lead, +/- nudge it a dollar or a week at a time, and the
+-// button says what it will actually cost. The number fields still accept
+-// typing for anyone who'd rather jump straight to a figure.
+-export function BidControls({
+-  amountValue, weeksValue, highBid, capMax, isLeading, statSize, compact,
+-  onAmountChange, onWeeksChange, onSubmit,
+-}) {
+-  const minimumBid = highBid + MIN_BID;
+-  const nextBid = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+-  const weeks = Number(weeksValue) > 0 ? Number(weeksValue) : 1;
+-  const canBid = !isLeading && nextBid > highBid && nextBid <= capMax;
+-
+-  const nudgeAmount = (delta) => {
+-    const base = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+-    onAmountChange(String(Math.max(0, Math.min(capMax, base + delta))));
+-  };
+-  const nudgeWeeks = (delta) => {
+-    onWeeksChange(String(Math.max(1, Math.min(MAX_CONTRACT_WEEKS, weeks + delta))));
+-  };
+-
+-  const row = { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 };
+-
+-  return (
+-    <div style={{ width: '100%' }}>
+-      <div style={{ ...row, marginTop: 8, flexWrap: 'wrap', columnGap: 3 }}>
+-        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
+-        <span>$</span>
+-        <input
+-          type="number"
+-          disabled={isLeading}
+-          value={amountValue}
+-          placeholder={String(minimumBid)}
+-          onChange={(e) => {
+-            const raw = e.target.value;
+-            onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
+-          }}
+-          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-          style={{ width: compact ? 46 : 62, padding: '2px 4px', textAlign: 'center' }}
+-        />
+-        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
+-
+-        <span style={{ width: 6, flex: '0 0 auto' }} />
+-
+-        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
+-        <input
+-          type="number"
+-          disabled={isLeading}
+-          value={weeksValue}
+-          placeholder="1"
+-          onChange={(e) => onWeeksChange(e.target.value)}
+-          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-          style={{ width: compact ? 36 : 48, padding: '2px 4px', textAlign: 'center' }}
+-        />
+-        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
+-        <span style={{ fontSize: statSize, color: '#fff' }}>
+-          {compact ? (weeks === 1 ? 'wk' : 'wks') : (weeks === 1 ? 'week' : 'weeks')}
+-        </span>
+-      </div>
+-
+-      <button
+-        disabled={!canBid}
+-        onClick={() => onSubmit(nextBid, weeks)}
+-        style={{
+-          marginTop: 8, width: '100%', border: '3px solid white',
+-          background: isLeading ? 'var(--color-success)' : 'var(--color-button-bg)',
+-          color: isLeading ? '#111' : 'var(--color-text)', fontWeight: 'bold',
+-        }}
+-      >
+-        {isLeading ? 'Leading' : `Bid $${nextBid}`}
+-      </button>
+-    </div>
+-  );
+-}
+-
+ // "vs KC" at home, "@ KC" away, "BYE" on a bye week. Empty string when the
+ // schedule hasn't loaded yet or the player has no NFL team, so the caller can
+ // render the price on its own rather than a placeholder.
+diff --git a/web/src/pages/DraftRoom.jsx b/web/src/pages/DraftRoom.jsx
+index 3e4f642..a37be66 100644
+--- a/web/src/pages/DraftRoom.jsx
++++ b/web/src/pages/DraftRoom.jsx
+@@ -1,6 +1,6 @@
+ import { Fragment, useEffect, useRef, useState } from 'react';
+ import { supabase } from '../supabaseClient';
+-import { BidControls, formatMatchup, MAX_CONTRACT_WEEKS, MIN_BID } from '../draftControls';
++import { formatMatchup, MAX_CONTRACT_WEEKS, MIN_BID } from '../draftControls';
+ 
+ const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
+ 
+@@ -1273,7 +1273,7 @@ useEffect(() => {
+         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+         return (
+           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++            Wk {wk}{matchup && ` (${matchup})`}: —
+           </div>
+         );
+       })}
+@@ -1384,17 +1384,38 @@ useEffect(() => {
+                           )}
+                         </div>
+ 
+-                        <BidControls
+-                          amountValue={s.myBidAmount}
+-                          weeksValue={s.myWeeks}
+-                          highBid={s.highBid}
+-                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-                          isLeading={isMyBid}
+-                          statSize="0.85rem"
+-                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-                        />
++                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
++                          <span>$</span>
++                          <input
++                            type="number"
++                            disabled={isMyBid}
++                            value={s.myBidAmount}
++                            onChange={(e) => {
++                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
++                              const raw = e.target.value;
++                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
++                              updateSlotBidAmount(s.key, clamped);
++                            }}
++                            style={{ width: 54 }}
++                          />
++                          <span>/</span>
++                          <input
++                            type="number"
++                            disabled={isMyBid}
++                            value={s.myWeeks}
++                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
++                            style={{ width: 44 }}
++                          />
++                          <span style={{ color: '#fff' }}>weeks</span>
++                        </div>
++
++                        <button
++                          disabled={!(Number(s.myBidAmount) > s.highBid)}
++                          onClick={() => submitBid(s.key)}
++                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
++                        >
++                          Submit Bid
++                        </button>
+ 
+                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                       </div>
+@@ -1555,8 +1576,7 @@ useEffect(() => {
+                         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+                         return (
+                           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+-                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++                            Wk {wk}{matchup && ` (${matchup})`}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+                           </div>
+                         );
+                       })}
+@@ -1569,20 +1589,45 @@ useEffect(() => {
+                   >
+                     <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={34} />
+                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
++                    {s.highBidderTeamName && (
++                      <span className="muted-text" style={{ fontSize: sizing.statSize, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
++                        {teamNameFor(s.highBidderTeamId, s.highBidderTeamName)}
++                      </span>
++                    )}
+                   </div>
+ 
+-                  <BidControls
+-                    compact
+-                    amountValue={s.myBidAmount}
+-                    weeksValue={s.myWeeks}
+-                    highBid={s.highBid}
+-                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-                    isLeading={isMyBid}
+-                    statSize={sizing.statSize}
+-                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-                  />
++                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
++                    <span>$</span>
++                    <input
++                      type="number"
++                      disabled={isMyBid}
++                      value={s.myBidAmount}
++                      onChange={(e) => {
++                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
++                        const raw = e.target.value;
++                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
++                        updateSlotBidAmount(s.key, clamped);
++                      }}
++                      style={{ width: 44, padding: '2px 4px' }}
++                    />
++                    <span>/</span>
++                    <input
++                      type="number"
++                      disabled={isMyBid}
++                      value={s.myWeeks}
++                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
++                      style={{ width: 36, padding: '2px 4px' }}
++                    />
++                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
++                  </div>
++
++                  <button
++                    disabled={!(Number(s.myBidAmount) > s.highBid)}
++                    onClick={() => submitBid(s.key)}
++                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
++                  >
++                    Submit Bid
++                  </button>
+ 
+             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                 </div>
+diff --git a/web/src/pages/MockDraft.jsx b/web/src/pages/MockDraft.jsx
+index 79c0617..ff88463 100644
+--- a/web/src/pages/MockDraft.jsx
++++ b/web/src/pages/MockDraft.jsx
+@@ -1,6 +1,6 @@
+ import { Fragment, useEffect, useRef, useState } from 'react';
+ import { supabase } from '../supabaseClient';
+-import { BidControls, formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
++import { formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
+ 
+ const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
+ 
+@@ -948,7 +948,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
+         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+         return (
+           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++            Wk {wk}{matchup && ` (${matchup})`}: —
+           </div>
+         );
+       })}
+@@ -1070,19 +1070,43 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                             <Crest pattern="solid" color1="#888888" color2="#888888" size={40} />
+                           )}
+                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
++                          {s.highBidderTeamName && (
++                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.highBidderTeamName}</span>
++                          )}
+                         </div>
+ 
+-                        <BidControls
+-                          amountValue={s.myBidAmount}
+-                          weeksValue={s.myWeeks}
+-                          highBid={s.highBid}
+-                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-                          isLeading={isMyBid}
+-                          statSize="0.85rem"
+-                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-                        />
++                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
++                          <span>$</span>
++                          <input
++                            type="number"
++                            disabled={isMyBid}
++                            value={s.myBidAmount}
++                            onChange={(e) => {
++                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
++                              const raw = e.target.value;
++                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
++                              updateSlotBidAmount(s.key, clamped);
++                            }}
++                            style={{ width: 54 }}
++                          />
++                          <span>/</span>
++                          <input
++                            type="number"
++                            disabled={isMyBid}
++                            value={s.myWeeks}
++                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
++                            style={{ width: 44 }}
++                          />
++                          <span style={{ color: '#fff' }}>weeks</span>
++                        </div>
++
++                        <button
++                          disabled={!(Number(s.myBidAmount) > s.highBid)}
++                          onClick={() => submitBid(s.key)}
++                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
++                        >
++                          Submit Bid
++                        </button>
+ 
+                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                       </div>
+@@ -1243,8 +1267,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+                         return (
+                           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+-                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++                            Wk {wk}{matchup && ` (${matchup})`}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+                           </div>
+                         );
+                       })}
+@@ -1258,20 +1281,45 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                       <Crest pattern="solid" color1="#888888" color2="#888888" size={34} />
+                     )}
+                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
++                    {s.highBidderTeamName && (
++                      <span className="muted-text" style={{ fontSize: sizing.statSize, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
++                        {s.highBidderTeamName}
++                      </span>
++                    )}
+                   </div>
+ 
+-                  <BidControls
+-                    compact
+-                    amountValue={s.myBidAmount}
+-                    weeksValue={s.myWeeks}
+-                    highBid={s.highBid}
+-                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-                    isLeading={isMyBid}
+-                    statSize={sizing.statSize}
+-                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-                  />
++                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
++                    <span>$</span>
++                    <input
++                      type="number"
++                      disabled={isMyBid}
++                      value={s.myBidAmount}
++                      onChange={(e) => {
++                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
++                        const raw = e.target.value;
++                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
++                        updateSlotBidAmount(s.key, clamped);
++                      }}
++                      style={{ width: 44, padding: '2px 4px' }}
++                    />
++                    <span>/</span>
++                    <input
++                      type="number"
++                      disabled={isMyBid}
++                      value={s.myWeeks}
++                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
++                      style={{ width: 36, padding: '2px 4px' }}
++                    />
++                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
++                  </div>
++
++                  <button
++                    disabled={!(Number(s.myBidAmount) > s.highBid)}
++                    onClick={() => submitBid(s.key)}
++                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
++                  >
++                    Submit Bid
++                  </button>
+ 
+             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                 </div>

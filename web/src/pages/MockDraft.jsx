@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
 import { supabase } from '../supabaseClient';
-import { BidControls, formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
+import { formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
 
 const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
 
@@ -948,7 +948,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
         return (
           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
-            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
+            Wk {wk}{matchup && ` (${matchup})`}: —
           </div>
         );
       })}
@@ -1070,19 +1070,43 @@ function buildNominationRound(order, startIndex, myTeamName) {
                             <Crest pattern="solid" color1="#888888" color2="#888888" size={40} />
                           )}
                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+                          {s.highBidderTeamName && (
+                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.highBidderTeamName}</span>
+                          )}
                         </div>
 
-                        <BidControls
-                          amountValue={s.myBidAmount}
-                          weeksValue={s.myWeeks}
-                          highBid={s.highBid}
-                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
-                          isLeading={isMyBid}
-                          statSize="0.85rem"
-                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
-                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
-                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
-                        />
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
+                          <span>$</span>
+                          <input
+                            type="number"
+                            disabled={isMyBid}
+                            value={s.myBidAmount}
+                            onChange={(e) => {
+                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
+                              const raw = e.target.value;
+                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
+                              updateSlotBidAmount(s.key, clamped);
+                            }}
+                            style={{ width: 54 }}
+                          />
+                          <span>/</span>
+                          <input
+                            type="number"
+                            disabled={isMyBid}
+                            value={s.myWeeks}
+                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
+                            style={{ width: 44 }}
+                          />
+                          <span style={{ color: '#fff' }}>weeks</span>
+                        </div>
+
+                        <button
+                          disabled={!(Number(s.myBidAmount) > s.highBid)}
+                          onClick={() => submitBid(s.key)}
+                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+                        >
+                          Submit Bid
+                        </button>
 
                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
                       </div>
@@ -1243,8 +1267,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
                         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
                         return (
                           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
-                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
-                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
+                            Wk {wk}{matchup && ` (${matchup})`}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
                           </div>
                         );
                       })}
@@ -1258,20 +1281,45 @@ function buildNominationRound(order, startIndex, myTeamName) {
                       <Crest pattern="solid" color1="#888888" color2="#888888" size={34} />
                     )}
                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+                    {s.highBidderTeamName && (
+                      <span className="muted-text" style={{ fontSize: sizing.statSize, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {s.highBidderTeamName}
+                      </span>
+                    )}
                   </div>
 
-                  <BidControls
-                    compact
-                    amountValue={s.myBidAmount}
-                    weeksValue={s.myWeeks}
-                    highBid={s.highBid}
-                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
-                    isLeading={isMyBid}
-                    statSize={sizing.statSize}
-                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
-                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
-                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
-                  />
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
+                    <span>$</span>
+                    <input
+                      type="number"
+                      disabled={isMyBid}
+                      value={s.myBidAmount}
+                      onChange={(e) => {
+                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
+                        const raw = e.target.value;
+                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
+                        updateSlotBidAmount(s.key, clamped);
+                      }}
+                      style={{ width: 44, padding: '2px 4px' }}
+                    />
+                    <span>/</span>
+                    <input
+                      type="number"
+                      disabled={isMyBid}
+                      value={s.myWeeks}
+                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
+                      style={{ width: 36, padding: '2px 4px' }}
+                    />
+                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
+                  </div>
+
+                  <button
+                    disabled={!(Number(s.myBidAmount) > s.highBid)}
+                    onClick={() => submitBid(s.key)}
+                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+                  >
+                    Submit Bid
+                  </button>
 
             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
                 </div>

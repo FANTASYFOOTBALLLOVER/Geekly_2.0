@@ -1,0 +1,2234 @@
+From 67748d0a9dd49c52cfab20b45f526a83dbeb119a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 27 Aug 2026 02:51:29 +0000
+Subject: [PATCH 1/2] Bring the bid controls and weekly fixtures to the Mock
+ Draft too
+
+The Mock Draft runs its own copy of the auction board, so none of the
+draft-room work showed up there: it still had the two bare number fields
+and a "Submit Bid" button, and week lines with no fixture. That is the
+screen it is easiest to open, which made the changes look like they had
+never landed.
+
+Rather than a third copy of the same markup, the bid controls and the
+fixture formatter move to web/src/draftControls.jsx and both pages import
+them. Mock Draft picks up the steppers, the minimum-bid default, Enter to
+submit, the priced button, and "vs KC" / "@ KC" / "BYE" beside each week.
+
+Also drops the three .patch files that were committed by accident.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Sdnuo56mhnsF6pDMCCDm3h
+---
+ draftroomfixes.patch        | 774 ------------------------------------
+ fixcroppedtimer.patch       |  69 ----
+ fixturesandteamnames.patch  | 479 ----------------------
+ web/src/draftControls.jsx   |  99 +++++
+ web/src/pages/DraftRoom.jsx |  96 +----
+ web/src/pages/MockDraft.jsx | 140 +++----
+ 6 files changed, 165 insertions(+), 1492 deletions(-)
+ delete mode 100644 draftroomfixes.patch
+ delete mode 100644 fixcroppedtimer.patch
+ delete mode 100644 fixturesandteamnames.patch
+ create mode 100644 web/src/draftControls.jsx
+
+diff --git a/draftroomfixes.patch b/draftroomfixes.patch
+deleted file mode 100644
+index a803edc..0000000
+--- a/draftroomfixes.patch
++++ /dev/null
+@@ -1,774 +0,0 @@
+-From d0ada02aea30db98b329bbf67f6a899c0e695ef9 Mon Sep 17 00:00:00 2001
+-From: Claude <noreply@anthropic.com>
+-Date: Thu, 27 Aug 2026 02:20:49 +0000
+-Subject: [PATCH] Fix draft room ejection on tab switch, empty rosters, and
+- blank crests
+-MIME-Version: 1.0
+-Content-Type: text/plain; charset=UTF-8
+-Content-Transfer-Encoding: 8bit
+-
+-Switching tabs threw people out of the draft room because supabase-js
+-re-emits SIGNED_IN on routine session recovery — including every time the
+-tab becomes visible again — and the auth handler routed every SIGNED_IN
+-back to Home. It now compares the session's user id against who we already
+-consider signed in, so only a genuinely new login changes the view.
+-
+-Leaving the draft and coming back showed an empty roster panel: signings
+-were only fetched during the 'winners' phase, so re-entering mid-round had
+-nothing to render. Rosters now load when the room opens as well.
+-
+-Every team but your own flew an anonymous grey shield. Teams and profiles
+-are both publicly readable, so the room now fetches each team's owner crest
+-once and resolves every shield — nominations, live bids, won players, the
+-team switcher — through a single crestFor() helper.
+-
+-Also:
+-- Auto-start no longer acts on the shared session's *default* 'pending'
+-  phase before the real row has loaded, which could restart a draft already
+-  in progress, and it retries every 10s instead of once a second. Adds a
+-  commissioner override button.
+-- The draft closes out once every team is either roster-full or under a
+-  dollar of cap for the week. The client makes that call, since the
+-  bye-week and interest math lives here; draft-end-session.sql adds the
+-  RPC that makes it stick and needs running in the Supabase SQL editor.
+-- Bidding no longer requires typing: the amount defaults to the minimum
+-  winning bid, +/- nudge it a dollar or a week at a time, Enter submits,
+-  and the button names the price.
+-
+-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+-Claude-Session: https://claude.ai/code/session_01Sdnuo56mhnsF6pDMCCDm3h
+----
+- draft-end-session.sql       |  41 ++++
+- web/src/App.jsx             |  28 ++-
+- web/src/pages/DraftRoom.jsx | 424 +++++++++++++++++++++++++-----------
+- 3 files changed, 358 insertions(+), 135 deletions(-)
+- create mode 100644 draft-end-session.sql
+-
+-diff --git a/draft-end-session.sql b/draft-end-session.sql
+-new file mode 100644
+-index 0000000..79f97cc
+---- /dev/null
+-+++ b/draft-end-session.sql
+-@@ -0,0 +1,41 @@
+-+-- ============================================================
+-+-- draft_end_session — closes a league's auction out for good.
+-+--
+-+-- Run this in the Supabase SQL Editor once. It is kept separate from
+-+-- schema.sql because it depends on the draft_sessions table, which is
+-+-- created alongside the rest of the live-draft RPCs rather than in
+-+-- schema.sql.
+-+--
+-+-- The draft room works out *when* an auction is finished (every team either
+-+-- has a full roster or has too little cap left this week to sign anybody)
+-+-- because that calculation needs the same bye-week and interest math the
+-+-- board already runs. This function is the other half: it takes that call
+-+-- from a league member and makes it stick for everyone.
+-+-- ============================================================
+-+
+-+create or replace function draft_end_session(p_league_id bigint)
+-+returns void as $$
+-+begin
+-+  -- Only someone actually in the league may end its draft.
+-+  if not exists (
+-+    select 1 from teams
+-+     where teams.league_id = p_league_id
+-+       and teams.owner_id = auth.uid()
+-+  ) and not exists (
+-+    select 1 from leagues
+-+     where leagues.id = p_league_id
+-+       and leagues.owner_id = auth.uid()
+-+  ) then
+-+    raise exception 'Not a member of this league';
+-+  end if;
+-+
+-+  -- A draft that never started stays pending, and one already ended stays
+-+  -- ended — this only closes out an auction that is genuinely in progress.
+-+  update draft_sessions
+-+     set phase = 'ended'
+-+   where league_id = p_league_id
+-+     and phase not in ('pending', 'ended');
+-+end;
+-+$$ language plpgsql security definer set search_path = public;
+-+
+-+grant execute on function draft_end_session to authenticated;
+-diff --git a/web/src/App.jsx b/web/src/App.jsx
+-index 8aa0b66..100feed 100644
+---- a/web/src/App.jsx
+-+++ b/web/src/App.jsx
+-@@ -1,4 +1,4 @@
+--import { useEffect, useState } from 'react';
+-+import { useEffect, useRef, useState } from 'react';
+- import { supabase } from './supabaseClient';
+- import Landing from './pages/Landing';
+- import SignUp from './pages/SignUp';
+-@@ -15,6 +15,12 @@ export default function App() {
+-   const [checkingSession, setCheckingSession] = useState(true);
+-   const [draftLeagueContext, setDraftLeagueContext] = useState(null);
+- 
+-+  // Who we already consider signed in. supabase-js re-emits SIGNED_IN for the
+-+  // same user on routine session recovery (notably every time the tab becomes
+-+  // visible again), so the user id — not the event name — is what tells a real
+-+  // new sign-in apart from background upkeep.
+-+  const signedInUserIdRef = useRef(null);
+-+
+-   async function fetchProfile(session) {
+-     if (!session) return null;
+-     const { data: profileRow } = await supabase
+-@@ -27,11 +33,13 @@ export default function App() {
+- 
+-   async function loadProfileAndRouteInitial(session) {
+-     if (!session) {
+-+      signedInUserIdRef.current = null;
+-       setProfile(null);
+-       setView('landing');
+-       return;
+-     }
+- 
+-+    signedInUserIdRef.current = session.user.id;
+-     const profileRow = await fetchProfile(session);
+-     setProfile(profileRow);
+- 
+-@@ -73,11 +81,16 @@ export default function App() {
+-         return;
+-       }
+-       if (_event === 'SIGNED_OUT') {
+-+        signedInUserIdRef.current = null;
+-         setProfile(null);
+-         setView('landing');
+-         return;
+-       }
+--      if (_event === 'SIGNED_IN' && session) {
+-+      // SIGNED_IN fires both for a real login and for routine session recovery
+-+      // — including every time the tab regains visibility. Only a session for
+-+      // someone we weren't already signed in as is a real login worth routing on.
+-+      if (_event === 'SIGNED_IN' && session && session.user.id !== signedInUserIdRef.current) {
+-+        signedInUserIdRef.current = session.user.id;
+-         fetchProfile(session).then((profileRow) => {
+-           setProfile(profileRow);
+-           if (!profileRow || !profileRow.username) {
+-@@ -88,12 +101,13 @@ export default function App() {
+-         });
+-         return;
+-       }
+--      // Any other event (TOKEN_REFRESHED, INITIAL_SESSION, USER_UPDATED, etc.)
+--      // is routine background upkeep, not a real sign-in — never change the
+--      // current view for these, so switching tabs or sitting idle for a
+--      // while never yanks someone out of wherever they currently are,
+--      // mid-draft included.
+-+      // Everything else (a re-emitted SIGNED_IN for the same user, plus
+-+      // TOKEN_REFRESHED, INITIAL_SESSION, USER_UPDATED, etc.) is routine
+-+      // background upkeep, not a real sign-in — never change the current view
+-+      // for these, so switching tabs or sitting idle for a while never yanks
+-+      // someone out of wherever they currently are, mid-draft included.
+-       if (session) {
+-+        signedInUserIdRef.current = session.user.id;
+-         fetchProfile(session).then((profileRow) => setProfile(profileRow));
+-       }
+-     });
+-diff --git a/web/src/pages/DraftRoom.jsx b/web/src/pages/DraftRoom.jsx
+-index 2372d17..e7c99f3 100644
+---- a/web/src/pages/DraftRoom.jsx
+-+++ b/web/src/pages/DraftRoom.jsx
+-@@ -26,6 +26,9 @@ const POSITION_ROW_TINT = {
+- 
+- const MAX_CONTRACT_WEEKS = 18; // no real "max contract length" setting exists yet — hardcoded per spec
+- const NOMINATION_SECONDS = 20;
+-+const AUTO_START_RETRY_MS = 10000;
+-+const END_CHECK_RETRY_MS = 10000;
+-+const MIN_BID = 1; // a team with less than this left for the week can't sign anyone else
+- const CPU_NOMINATE_DELAY_MS = 1000;
+- const WINNERS_DISPLAY_MS = 2000;
+- 
+-@@ -66,6 +69,85 @@ function Crest({ pattern, color1, color2, size = 28, onClick }) {
+-   );
+- }
+- 
+-+const STEPPER_BUTTON_STYLE = {
+-+  width: 22, height: 22, padding: 0, borderRadius: '50%', lineHeight: 1,
+-+  background: 'var(--color-button-bg)', border: '1px solid var(--color-border)',
+-+  color: 'var(--color-text)', fontWeight: 'bold', flex: '0 0 auto',
+-+};
+-+
+-+// Bidding without having to type: the amount defaults to the smallest bid that
+-+// would take the lead, +/- nudge it a dollar or a week at a time, and the
+-+// button says what it will actually cost. The number fields still accept
+-+// typing for anyone who'd rather jump straight to a figure.
+-+function BidControls({
+-+  amountValue, weeksValue, highBid, capMax, isLeading, statSize, compact,
+-+  onAmountChange, onWeeksChange, onSubmit,
+-+}) {
+-+  const minimumBid = highBid + MIN_BID;
+-+  const nextBid = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+-+  const weeks = Number(weeksValue) > 0 ? Number(weeksValue) : 1;
+-+  const canBid = !isLeading && nextBid > highBid && nextBid <= capMax;
+-+
+-+  const nudgeAmount = (delta) => {
+-+    const base = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+-+    onAmountChange(String(Math.max(0, Math.min(capMax, base + delta))));
+-+  };
+-+  const nudgeWeeks = (delta) => {
+-+    onWeeksChange(String(Math.max(1, Math.min(MAX_CONTRACT_WEEKS, weeks + delta))));
+-+  };
+-+
+-+  const row = { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 };
+-+
+-+  return (
+-+    <div style={{ width: '100%' }}>
+-+      <div style={{ ...row, marginTop: 8 }}>
+-+        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
+-+        <span>$</span>
+-+        <input
+-+          type="number"
+-+          disabled={isLeading}
+-+          value={amountValue}
+-+          placeholder={String(minimumBid)}
+-+          onChange={(e) => {
+-+            const raw = e.target.value;
+-+            onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
+-+          }}
+-+          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-+          style={{ width: compact ? 50 : 62, padding: '2px 4px', textAlign: 'center' }}
+-+        />
+-+        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
+-+      </div>
+-+
+-+      <div style={{ ...row, marginTop: 6 }}>
+-+        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
+-+        <input
+-+          type="number"
+-+          disabled={isLeading}
+-+          value={weeksValue}
+-+          placeholder="1"
+-+          onChange={(e) => onWeeksChange(e.target.value)}
+-+          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-+          style={{ width: compact ? 40 : 48, padding: '2px 4px', textAlign: 'center' }}
+-+        />
+-+        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
+-+        <span style={{ fontSize: statSize, color: '#fff' }}>{weeks === 1 ? 'week' : 'weeks'}</span>
+-+      </div>
+-+
+-+      <button
+-+        disabled={!canBid}
+-+        onClick={() => onSubmit(nextBid, weeks)}
+-+        style={{
+-+          marginTop: 8, width: '100%', border: '3px solid white',
+-+          background: isLeading ? 'var(--color-success)' : 'var(--color-button-bg)',
+-+          color: isLeading ? '#111' : 'var(--color-text)', fontWeight: 'bold',
+-+        }}
+-+      >
+-+        {isLeading ? 'Leading' : `Bid $${nextBid}`}
+-+      </button>
+-+    </div>
+-+  );
+-+}
+-+
+- function formatMMSS(totalSeconds) {
+-   const m = Math.floor(totalSeconds / 60);
+-   const sec = totalSeconds % 60;
+-@@ -284,6 +366,8 @@ export default function DraftRoom({ league, profile, onBack }) {
+-   const [rankedPlayers, setRankedPlayers] = useState([]);
+-   const [wonPlayers, setWonPlayers] = useState([]);
+-   const [allWonPlayers, setAllWonPlayers] = useState([]);
+-+  const [signingsLoaded, setSigningsLoaded] = useState(false);
+-+  const [leagueTeams, setLeagueTeams] = useState([]);
+-   const [viewingTeamName, setViewingTeamName] = useState(null);
+-   const [crestData, setCrestData] = useState({ pattern: 'vertical', color1: '#888888', color2: '#ffffff' });
+-   const [teamName, setTeamName] = useState('My Team');
+-@@ -312,6 +396,8 @@ export default function DraftRoom({ league, profile, onBack }) {
+-   const [flippedKeys, setFlippedKeys] = useState(() => new Set());
+-   const [flashUntilByKey, setFlashUntilByKey] = useState({});
+-   const prevAuctionSlotsRef = useRef([]);
+-+  const nextAutoStartAttemptRef = useRef(0);
+-+  const nextEndCheckAttemptRef = useRef(0);
+- 
+-   const rankedPlayersRef = useRef(rankedPlayers);
+-   rankedPlayersRef.current = rankedPlayers;
+-@@ -359,6 +445,44 @@ export default function DraftRoom({ league, profile, onBack }) {
+-       });
+-   }, [league]);
+- 
+-+  // Every team in this league, paired with its owner's crest. Both tables are
+-+  // publicly readable, so this is the one fetch that lets the board show whose
+-+  // shield is actually on a nomination, a bid, or a won player — previously
+-+  // every team but your own fell back to an anonymous grey shield.
+-+  useEffect(() => {
+-+    if (!league) return;
+-+    let cancelled = false;
+-+    supabase
+-+      .from('teams')
+-+      .select('id, team_name, owner_id')
+-+      .eq('league_id', league.league_id)
+-+      .then(({ data: teamRows, error: teamsErr }) => {
+-+        if (cancelled) return;
+-+        if (teamsErr) { console.error('team crest fetch failed:', teamsErr); return; }
+-+        const rows = teamRows || [];
+-+        const ownerIds = rows.map((t) => t.owner_id).filter(Boolean);
+-+        if (ownerIds.length === 0) { setLeagueTeams(rows.map((t) => ({ ...t, crest: null }))); return; }
+-+        supabase
+-+          .from('profiles')
+-+          .select('id, crest_pattern, crest_color1, crest_color2')
+-+          .in('id', ownerIds)
+-+          .then(({ data: profileRows, error: profErr }) => {
+-+            if (cancelled) return;
+-+            if (profErr) { console.error('crest profile fetch failed:', profErr); }
+-+            const crestByOwner = {};
+-+            (profileRows || []).forEach((p) => {
+-+              crestByOwner[p.id] = {
+-+                pattern: p.crest_pattern || 'vertical',
+-+                color1: p.crest_color1 || '#888888',
+-+                color2: p.crest_color2 || '#ffffff',
+-+              };
+-+            });
+-+            setLeagueTeams(rows.map((t) => ({ ...t, crest: crestByOwner[t.owner_id] || null })));
+-+          });
+-+      });
+-+    return () => { cancelled = true; };
+-+  }, [league]);
+-+
+-   // Ticking clock drives countdown displays and all phase resolution
+-   useEffect(() => {
+-     const interval = setInterval(() => setTick(Date.now()), 1000);
+-@@ -462,7 +586,14 @@ useEffect(() => {
+-   }
+- 
+-   async function beginNominationRound() {
+--    await supabase.rpc('start_draft_session', { p_league_id: league.league_id });
+-+    const { error: startErr } = await supabase.rpc('start_draft_session', { p_league_id: league.league_id });
+-+    if (startErr) {
+-+      console.error('start_draft_session failed:', startErr);
+-+      setError(`Could not start the auction: ${startErr.message}`);
+-+      return false;
+-+    }
+-+    setError('');
+-+    return true;
+-   }
+- 
+-   function myPendingNominationSlot() {
+-@@ -470,6 +601,21 @@ useEffect(() => {
+-     return nominationSlots.find((s) => s.isMe && !s.player) || null;
+-   }
+- 
+-+  // Resolves whichever team a card belongs to into the crest that should fly
+-+  // on it. Falls back to the anonymous grey shield only when the team really
+-+  // is unknown (someone who hasn't picked a crest, or a card with no team yet).
+-+  function crestFor(teamId, fallbackTeamName) {
+-+    const hasId = teamId !== null && teamId !== undefined;
+-+    if ((hasId && Number(teamId) === Number(league?.team_id)) || (!hasId && fallbackTeamName === teamName)) {
+-+      return { pattern: crestData.pattern, color1: crestData.color1, color2: crestData.color2 };
+-+    }
+-+    const match =
+-+      (hasId && leagueTeams.find((t) => Number(t.id) === Number(teamId))) ||
+-+      (fallbackTeamName && leagueTeams.find((t) => t.team_name === fallbackTeamName));
+-+    if (match && match.crest) return match.crest;
+-+    return { pattern: 'solid', color1: '#888888', color2: '#888888' };
+-+  }
+-+
+-   function statsRowFor(player, view) {
+-     if (view === 'current') return seasonStats2025[player.sleeper_id] || null;
+-     if (view === 'previous') return seasonStats2024[player.sleeper_id] || null;
+-@@ -543,12 +689,13 @@ useEffect(() => {
+-     setHiddenWeeks((prev) => prev.slice(0, -1));
+-   }
+- 
+--  async function submitBid(key) {
+-+  async function submitBid(key, amountOverride, weeksOverride) {
+-     const s = slots.find((row) => row.key === key);
+-     if (!s || s.completed) return;
+-     if (s.highBidder === 'me') return; // already leading — locked until outbid
+--    const amount = Number(s.myBidAmount);
+--    const weeksEntered = Number(s.myWeeks) > 0 ? Number(s.myWeeks) : 1;
+-+    const amount = Number(amountOverride ?? s.myBidAmount);
+-+    const rawWeeks = Number(weeksOverride ?? s.myWeeks);
+-+    const weeksEntered = rawWeeks > 0 ? rawWeeks : 1;
+-     if (!amount || amount <= s.highBid) return;
+- 
+-     const violatedWeeks = [];
+-@@ -715,6 +862,7 @@ useEffect(() => {
+-     player: s.player,
+-     highBid: Number(s.highBid),
+-     highBidder: Number(s.highBidderTeamId) === league?.team_id ? 'me' : 'bot',
+-+    highBidderTeamId: s.highBidderTeamId,
+-     highBidderTeamName: s.highBidderTeamName,
+-     committedWeeks: Number(s.myWeeks) || 1,
+-     myBidAmount: myBidInputs[s.key] ?? '',
+-@@ -727,6 +875,7 @@ useEffect(() => {
+- 
+-   const winnersDisplay = (session?.winners_display || []).map((s) => ({
+-     player: s.player,
+-+    teamId: s.highBidderTeamId,
+-     teamName: s.highBidderTeamName,
+-     isMe: Number(s.highBidderTeamId) === league?.team_id,
+-     amount: Number(s.highBid),
+-@@ -751,27 +900,42 @@ useEffect(() => {
+-   }, [session?.auction_slots]);
+- 
+-   // Roster data is the real, authoritative source of truth (the signings
+--  // table), not a client-side accumulation of transient realtime snapshots —
+--  // refetch it every time a round actually finishes, so both my own roster
+--  // and every other team's roster stay correct all the way through the draft,
+--  // not just once at the very end.
+--  useEffect(() => {
+--    if (!league || phase !== 'winners') return;
+--    supabase.rpc('get_league_signings', { p_league_id: league.league_id, p_season: 2026 }).then(({ data, error: sigErr }) => {
+--      if (sigErr) { console.error('get_league_signings failed:', sigErr); return; }
+--      const rows = data || [];
+--      const toEntry = (row) => ({
+--        teamName: row.team_name,
+--        isMe: row.team_id === league.team_id,
+--        player: { sleeper_id: row.sleeper_id, full_name: row.full_name, player_position: row.player_position, team: row.team },
+--        startWeek: row.start_week,
+--        weeksRequested: row.weeks_requested,
+--        baseValue: Number(row.base_value),
+--      });
+--      setAllWonPlayers(rows.map(toEntry));
+--      setWonPlayers(rows.filter((row) => row.team_id === league.team_id).map(toEntry));
+-+  // table), not a client-side accumulation of transient realtime snapshots.
+-+  async function loadSignings() {
+-+    if (!league) return;
+-+    const { data, error: sigErr } = await supabase.rpc('get_league_signings', {
+-+      p_league_id: league.league_id, p_season: 2026,
+-     });
+--  }, [league, phase]);
+-+    if (sigErr) { console.error('get_league_signings failed:', sigErr); return; }
+-+    const rows = (data || []).filter((row) => row.sleeper_id);
+-+    const toEntry = (row) => ({
+-+      teamId: row.team_id,
+-+      teamName: row.team_name,
+-+      isMe: row.team_id === league.team_id,
+-+      player: { sleeper_id: row.sleeper_id, full_name: row.full_name, player_position: row.player_position, team: row.team },
+-+      startWeek: row.start_week,
+-+      weeksRequested: row.weeks_requested,
+-+      baseValue: Number(row.base_value),
+-+    });
+-+    setAllWonPlayers(rows.map(toEntry));
+-+    setWonPlayers(rows.filter((row) => row.team_id === league.team_id).map(toEntry));
+-+    setSigningsLoaded(true);
+-+  }
+-+
+-+  // Load rosters as soon as the room opens, so leaving and coming back
+-+  // mid-draft shows every contract already signed rather than an empty
+-+  // roster panel, and refetch every time a round finishes so both my own
+-+  // roster and every other team's stay correct all the way through.
+-+  useEffect(() => {
+-+    loadSignings();
+-+    // eslint-disable-next-line react-hooks/exhaustive-deps
+-+  }, [league]);
+-+
+-+  useEffect(() => {
+-+    if (phase !== 'winners') return;
+-+    loadSignings();
+-+    // eslint-disable-next-line react-hooks/exhaustive-deps
+-+  }, [phase]);
+- 
+-   useEffect(() => {
+-     if (phase !== 'auction' || playersPerAuction !== 1 || slots.length === 0) return;
+-@@ -786,6 +950,45 @@ useEffect(() => {
+-   const gridCols = computeGridColumns(playersPerAuction);
+-   const weekNumbers = Array.from({ length: MAX_CONTRACT_WEEKS }, (_, i) => currentWeek + i);
+- 
+-+  const rosterSize = leagueRosterSpec
+-+    ? ['roster_qb', 'roster_rb', 'roster_wr', 'roster_te', 'roster_flex', 'roster_superflex', 'roster_bench']
+-+        .reduce((sum, field) => sum + (Number(leagueRosterSpec[field]) || 0), 0)
+-+    : 0;
+-+
+-+  // A team is out of the auction once it has no roster spot left to fill, or
+-+  // has too little cap left this week to sign anyone at all.
+-+  function teamIsDone(team) {
+-+    const picks = allWonPlayers.filter((w) => Number(w.teamId) === Number(team.id));
+-+    if (picks.length >= rosterSize) return true;
+-+    const spentThisWeek = picks.reduce(
+-+      (sum, w) => sum + costAtWeekWithBye(w.baseValue, w.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[w.player.team]),
+-+      0
+-+    );
+-+    return salaryCap - spentThisWeek < MIN_BID;
+-+  }
+-+
+-+  const everyTeamIsDone =
+-+    signingsLoaded && rosterSize > 0 && leagueTeams.length > 0 && leagueTeams.every(teamIsDone);
+-+
+-+  // Close the draft out once there is nothing left for anyone to do. Whichever
+-+  // browser notices first tells the server, and the resulting phase change
+-+  // reaches everyone else over the same realtime channel as any other update.
+-+  useEffect(() => {
+-+    if (!league || !session) return;
+-+    if (session.phase === 'pending' || session.phase === 'ended') return;
+-+    if (!everyTeamIsDone) return;
+-+    const now = Date.now();
+-+    if (now < nextEndCheckAttemptRef.current) return;
+-+    nextEndCheckAttemptRef.current = now + END_CHECK_RETRY_MS;
+-+    supabase.rpc('draft_end_session', { p_league_id: league.league_id }).then(({ error: endErr }) => {
+-+      if (endErr) {
+-+        console.error('draft_end_session failed:', endErr);
+-+        setError(`Every team is full or out of cap room, but the draft could not be closed out: ${endErr.message}`);
+-+      }
+-+    });
+-+    // eslint-disable-next-line react-hooks/exhaustive-deps
+-+  }, [league, session?.phase, everyTeamIsDone]);
+-+
+- 
+-   const availablePositions = leagueRosterSpec
+-     ? [
+-@@ -816,13 +1019,21 @@ useEffect(() => {
+-     return null;
+-   })();
+- 
+-+  // Auto-start: the moment the scheduled kickoff passes (or immediately, for a
+-+  // league with no schedule set), the first browser in the room starts the
+-+  // auction for everyone. Gated on the shared session actually having loaded —
+-+  // before it arrives `phase` merely *defaults* to 'pending', and starting off
+-+  // that default would restart a draft that is already underway. Throttled so a
+-+  // failing start retries every 10s instead of firing once a second.
+-   useEffect(() => {
+--    if (started) return;
+-+    if (!session || session.phase !== 'pending') return;
+-     if (!scheduleLoaded || !draftPoolLoaded) return;
+-     if (auctionTarget && auctionTarget.getTime() > tick) return;
+-+    if (tick < nextAutoStartAttemptRef.current) return;
+-+    nextAutoStartAttemptRef.current = tick + AUTO_START_RETRY_MS;
+-     beginNominationRound();
+-     // eslint-disable-next-line react-hooks/exhaustive-deps
+--  }, [tick, started, scheduleLoaded, draftPoolLoaded]);
+-+  }, [tick, session, scheduleLoaded, draftPoolLoaded]);
+- 
+-   const nominationSecondsLeft = nominationTimerEndsAt ? Math.max(0, Math.round((nominationTimerEndsAt - tick) / 1000)) : NOMINATION_SECONDS;
+- 
+-@@ -935,11 +1146,7 @@ useEffect(() => {
+-             style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}
+-             onClick={() => setShowTeamDropdown((v) => !v)}
+-           >
+--            {(viewingTeamName === null || viewingTeamName === teamName) ? (
+--              <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={36} />
+--            ) : (
+--              <Crest pattern="solid" color1="#888888" color2="#888888" size={36} />
+--            )}
+-+            <Crest {...crestFor(null, viewingTeamName || teamName)} size={36} />
+-             <span style={{ fontWeight: 'bold' }}>{viewingTeamName || teamName} ▾</span>
+-           </div>
+-           <div style={{ display: 'flex', gap: 6 }}>
+-@@ -985,9 +1192,13 @@ useEffect(() => {
+-                     {(t.teams || []).filter((team) => team.team_name !== teamName).map((team) => (
+-                       <button
+-                         key={team.team_id}
+--                        style={{ display: 'block', width: '100%', textAlign: 'left', background: t.tier_color || 'var(--color-button-bg)', marginTop: 2 }}
+-+                        style={{
+-+                          display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left',
+-+                          background: t.tier_color || 'var(--color-button-bg)', marginTop: 2,
+-+                        }}
+-                         onClick={() => { setViewingTeamName(team.team_name === teamName ? null : team.team_name); setShowTeamDropdown(false); }}
+-                       >
+-+                        <Crest {...crestFor(team.team_id, team.team_name)} size={18} />
+-                         {team.team_name}
+-                       </button>
+-                     ))}
+-@@ -1046,11 +1257,7 @@ useEffect(() => {
+-                 </div>
+-                 {teamTurnOrder.length > 0 && (
+-                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 16 }}>
+--                    {teamTurnOrder[0].name === (league?.team_name || 'My Team') ? (
+--                      <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={28} />
+--                    ) : (
+--                      <Crest pattern="solid" color1="#888888" color2="#888888" size={28} />
+--                    )}
+-+                    <Crest {...crestFor(teamTurnOrder[0].teamId, teamTurnOrder[0].name)} size={28} />
+-                     <span style={{ color: 'var(--color-error)', fontWeight: 'bold' }}>
+-                       {teamTurnOrder[0].name} will be up first
+-                     </span>
+-@@ -1062,6 +1269,22 @@ useEffect(() => {
+-                 No auction is scheduled for this league yet.
+-               </div>
+-             )}
+-+            {league?.is_owner && (
+-+              <div style={{ marginTop: 20 }}>
+-+                <button
+-+                  onClick={() => { nextAutoStartAttemptRef.current = 0; beginNominationRound(); }}
+-+                  style={{
+-+                    background: 'var(--color-success)', color: '#111', fontWeight: 'bold',
+-+                    padding: '10px 24px', borderRadius: 8, border: 'none',
+-+                  }}
+-+                >
+-+                  Start Auction Now
+-+                </button>
+-+                <div className="settings-note" style={{ marginTop: 6 }}>
+-+                  The auction starts on its own at the scheduled time — this is just an override.
+-+                </div>
+-+              </div>
+-+            )}
+-           </div>
+-         ) : (
+-           <>
+-@@ -1115,17 +1338,13 @@ useEffect(() => {
+-       <div>Wk {currentWeek + 2}: —</div>
+-     </div>
+-     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
+--      {s.isMe ? (
+--        <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={22} />
+--      ) : (
+--        <Crest pattern="solid" color1="#fefefe" color2="#10ae3d" size={22} />
+--      )}
+-+      <Crest {...crestFor(s.teamId, s.teamName)} size={22} />
+-       <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.teamName}</span>
+-     </div>
+-   </>
+- ) : (
+-                   <>
+--                    <Crest pattern="solid" color1="#888888" color2="#888888" size={50} />
+-+                    <Crest {...crestFor(s.teamId, s.teamName)} size={50} />
+-                     <div style={{ fontWeight: 'bold', marginTop: 8 }}>{s.teamName}</div>
+-                     <div className="muted-text" style={{ fontSize: '0.75rem' }}>{s.isMe ? 'Your pick' : 'choosing...'}</div>
+-                   </>
+-@@ -1155,11 +1374,7 @@ useEffect(() => {
+-                 />
+-                 <div style={{ fontWeight: 'bold', marginTop: 8 }}>{w.player.full_name}</div>
+-                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }}>
+--                  {w.isMe ? (
+--                    <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={32} />
+--                  ) : (
+--                    <Crest pattern="solid" color1="#888888" color2="#888888" size={32} />
+--                  )}
+-+                  <Crest {...crestFor(w.teamId, w.teamName)} size={32} />
+-                   <span className="muted-text" style={{ fontSize: '0.85rem' }}>{w.teamName}</span>
+-                 </div>
+-                 <div style={{ color: 'var(--color-success)', fontWeight: 'bold', marginTop: 8 }}>${w.amount}</div>
+-@@ -1188,11 +1403,7 @@ useEffect(() => {
+-                       filter: 'grayscale(0.6) brightness(0.7)',
+-                     }}
+-                   >
+--                    {isMyBid ? (
+--                      <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={sizing.imgSize * 0.4} />
+--                    ) : (
+--                      <Crest pattern="solid" color1="#888888" color2="#888888" size={sizing.imgSize * 0.4} />
+--                    )}
+-+                    <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={sizing.imgSize * 0.4} />
+-                     <div style={{ fontWeight: 'bold', marginTop: 6 }}>{s.highBidderTeamName}</div>
+-                     <div className="muted-text" style={{ fontSize: sizing.statSize }}>{s.player.full_name}</div>
+-                     <div style={{ color: 'var(--color-success)', fontWeight: 'bold', marginTop: 4 }}>${s.highBid}</div>
+-@@ -1225,46 +1436,24 @@ useEffect(() => {
+-                         </div>
+- 
+-                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 12 }}>
+--                          {isMyBid ? (
+--                            <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={40} />
+--                          ) : (
+--                            <Crest pattern="solid" color1="#888888" color2="#888888" size={40} />
+--                          )}
+-+                          <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={40} />
+-                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+-+                          {s.highBidderTeamName && (
+-+                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.highBidderTeamName}</span>
+-+                          )}
+-                         </div>
+- 
+--                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
+--                          <span>$</span>
+--                          <input
+--                            type="number"
+--                            disabled={isMyBid}
+--                            value={s.myBidAmount}
+--                            onChange={(e) => {
+--                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
+--                              const raw = e.target.value;
+--                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
+--                              updateSlotBidAmount(s.key, clamped);
+--                            }}
+--                            style={{ width: 54 }}
+--                          />
+--                          <span>/</span>
+--                          <input
+--                            type="number"
+--                            disabled={isMyBid}
+--                            value={s.myWeeks}
+--                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
+--                            style={{ width: 44 }}
+--                          />
+--                          <span style={{ color: '#fff' }}>weeks</span>
+--                        </div>
+--
+--                        <button
+--                          disabled={!(Number(s.myBidAmount) > s.highBid)}
+--                          onClick={() => submitBid(s.key)}
+--                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+--                        >
+--                          Submit Bid
+--                        </button>
+-+                        <BidControls
+-+                          amountValue={s.myBidAmount}
+-+                          weeksValue={s.myWeeks}
+-+                          highBid={s.highBid}
+-+                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-+                          isLeading={isMyBid}
+-+                          statSize="0.85rem"
+-+                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-+                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-+                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-+                        />
+- 
+-                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+-                       </div>
+-@@ -1427,47 +1616,26 @@ useEffect(() => {
+-                     </div>
+-                   )}
+- 
+--                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8 }}>
+--                    {isMyBid ? (
+--                      <Crest pattern={crestData.pattern} color1={crestData.color1} color2={crestData.color2} size={34} />
+--                    ) : (
+--                      <Crest pattern="solid" color1="#888888" color2="#888888" size={34} />
+--                    )}
+-+                  <div
+-+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8 }}
+-+                    title={s.highBidderTeamName ? `Leading bid: ${s.highBidderTeamName}` : 'No bids yet'}
+-+                  >
+-+                    <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={34} />
+-                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+-                   </div>
+- 
+--                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
+--                    <span>$</span>
+--                    <input
+--                      type="number"
+--                      disabled={isMyBid}
+--                      value={s.myBidAmount}
+--                      onChange={(e) => {
+--                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
+--                        const raw = e.target.value;
+--                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
+--                        updateSlotBidAmount(s.key, clamped);
+--                      }}
+--                      style={{ width: 44, padding: '2px 4px' }}
+--                    />
+--                    <span>/</span>
+--                    <input
+--                      type="number"
+--                      disabled={isMyBid}
+--                      value={s.myWeeks}
+--                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
+--                      style={{ width: 36, padding: '2px 4px' }}
+--                    />
+--                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
+--                  </div>
+--
+--                  <button
+--                    disabled={!(Number(s.myBidAmount) > s.highBid)}
+--                    onClick={() => submitBid(s.key)}
+--                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+--                  >
+--                    Submit Bid
+--                  </button>
+-+                  <BidControls
+-+                    compact
+-+                    amountValue={s.myBidAmount}
+-+                    weeksValue={s.myWeeks}
+-+                    highBid={s.highBid}
+-+                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-+                    isLeading={isMyBid}
+-+                    statSize={sizing.statSize}
+-+                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-+                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-+                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-+                  />
+- 
+-             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+-                 </div>
+--- 
+-2.43.0
+-
+diff --git a/fixcroppedtimer.patch b/fixcroppedtimer.patch
+deleted file mode 100644
+index da9c8f4..0000000
+--- a/fixcroppedtimer.patch
++++ /dev/null
+@@ -1,69 +0,0 @@
+-From f518075d16e3d1f8ad96a09a04d678101f00a713 Mon Sep 17 00:00:00 2001
+-From: Claude <noreply@anthropic.com>
+-Date: Thu, 27 Aug 2026 02:36:09 +0000
+-Subject: [PATCH] Keep the bid controls on one row so the slot timer stays
+- visible
+-MIME-Version: 1.0
+-Content-Type: text/plain; charset=UTF-8
+-Content-Transfer-Encoding: 8bit
+-
+-Splitting the amount and the contract length onto separate rows made each
+-auction card a row taller than the board has space for, pushing the
+-per-slot countdown off the bottom of the panel. Both steppers now share a
+-single row — the same height the original two number fields occupied — and
+-the row wraps rather than overflowing if a card ever gets narrow enough to
+-need it.
+-
+-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+-Claude-Session: https://claude.ai/code/session_01Sdnuo56mhnsF6pDMCCDm3h
+----
+- web/src/pages/DraftRoom.jsx | 14 ++++++++------
+- 1 file changed, 8 insertions(+), 6 deletions(-)
+-
+-diff --git a/web/src/pages/DraftRoom.jsx b/web/src/pages/DraftRoom.jsx
+-index e7c99f3..4c9a11e 100644
+---- a/web/src/pages/DraftRoom.jsx
+-+++ b/web/src/pages/DraftRoom.jsx
+-@@ -100,7 +100,7 @@ function BidControls({
+- 
+-   return (
+-     <div style={{ width: '100%' }}>
+--      <div style={{ ...row, marginTop: 8 }}>
+-+      <div style={{ ...row, marginTop: 8, flexWrap: 'wrap', columnGap: 3 }}>
+-         <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
+-         <span>$</span>
+-         <input
+-@@ -113,12 +113,12 @@ function BidControls({
+-             onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
+-           }}
+-           onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+--          style={{ width: compact ? 50 : 62, padding: '2px 4px', textAlign: 'center' }}
+-+          style={{ width: compact ? 46 : 62, padding: '2px 4px', textAlign: 'center' }}
+-         />
+-         <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
+--      </div>
+- 
+--      <div style={{ ...row, marginTop: 6 }}>
+-+        <span style={{ width: 6, flex: '0 0 auto' }} />
+-+
+-         <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
+-         <input
+-           type="number"
+-@@ -127,10 +127,12 @@ function BidControls({
+-           placeholder="1"
+-           onChange={(e) => onWeeksChange(e.target.value)}
+-           onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+--          style={{ width: compact ? 40 : 48, padding: '2px 4px', textAlign: 'center' }}
+-+          style={{ width: compact ? 36 : 48, padding: '2px 4px', textAlign: 'center' }}
+-         />
+-         <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
+--        <span style={{ fontSize: statSize, color: '#fff' }}>{weeks === 1 ? 'week' : 'weeks'}</span>
+-+        <span style={{ fontSize: statSize, color: '#fff' }}>
+-+          {compact ? (weeks === 1 ? 'wk' : 'wks') : (weeks === 1 ? 'week' : 'weeks')}
+-+        </span>
+-       </div>
+- 
+-       <button
+--- 
+-2.43.0
+-
+diff --git a/fixturesandteamnames.patch b/fixturesandteamnames.patch
+deleted file mode 100644
+index c3e7171..0000000
+--- a/fixturesandteamnames.patch
++++ /dev/null
+@@ -1,479 +0,0 @@
+-From 4ced4962bdc7c720638dde28f2d8af939d0930ca Mon Sep 17 00:00:00 2001
+-From: Claude <noreply@anthropic.com>
+-Date: Thu, 27 Aug 2026 02:43:13 +0000
+-Subject: [PATCH] Show weekly fixtures on player cards; cap and live-sync team
+- names
+-MIME-Version: 1.0
+-Content-Type: text/plain; charset=UTF-8
+-Content-Transfer-Encoding: 8bit
+-
+-Each week's price on a player card now names the fixture beside it — "vs KC"
+-at home, "@ KC" away, "BYE" on a bye. The whole season's schedule comes from
+-one query against `games`, which is already publicly readable, so this needs
+-no new RPC and no migration: it's keyed by team and week and shared by every
+-card on the board. Nomination cards get the same line.
+-
+-Team names were capped nowhere. The name field now stops at 20 characters
+-with a live counter beside it, and saving trims whitespace and rejects an
+-empty name, matching the 3-character cap the abbreviation already had.
+-
+-Team names also never updated for anyone but the person who changed them:
+-the draft session stores whatever a team was called at the moment it
+-nominated or bid, so a rename left stale names on every other board. Names
+-now resolve from the live `teams` row by id, falling back to that snapshot
+-only for a team not yet loaded, and the room subscribes to `teams` so a
+-rename reaches every browser without a refresh. The roster panel is keyed by
+-team id rather than team name for the same reason, which also retires
+-buildMyRosterSlots — it was a duplicate of buildRosterSlotsForTeam.
+-
+-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+-Claude-Session: https://claude.ai/code/session_01Sdnuo56mhnsF6pDMCCDm3h
+----
+- web/src/pages/DraftRoom.jsx | 219 +++++++++++++++++++++---------------
+- web/src/pages/Home.jsx      |  26 ++++-
+- 2 files changed, 152 insertions(+), 93 deletions(-)
+-
+-diff --git a/web/src/pages/DraftRoom.jsx b/web/src/pages/DraftRoom.jsx
+-index 4c9a11e..4941e84 100644
+---- a/web/src/pages/DraftRoom.jsx
+-+++ b/web/src/pages/DraftRoom.jsx
+-@@ -150,6 +150,18 @@ function BidControls({
+-   );
+- }
+- 
+-+// "vs KC" at home, "@ KC" away, "BYE" on a bye week. Empty string when the
+-+// schedule hasn't loaded yet or the player has no NFL team, so the caller can
+-+// render the price on its own rather than a placeholder.
+-+function formatMatchup(scheduleByTeam, nflTeam, week) {
+-+  if (!nflTeam) return '';
+-+  const teamGames = scheduleByTeam[nflTeam];
+-+  if (!teamGames) return '';
+-+  const game = teamGames[week];
+-+  if (!game) return 'BYE';
+-+  return `${game.isHome ? 'vs' : '@'} ${game.opponent}`;
+-+}
+-+
+- function formatMMSS(totalSeconds) {
+-   const m = Math.floor(totalSeconds / 60);
+-   const sec = totalSeconds % 60;
+-@@ -363,6 +375,7 @@ export default function DraftRoom({ league, profile, onBack }) {
+-   const [editableResetSeconds, setEditableResetSeconds] = useState(20);
+-   const [settingsMsg, setSettingsMsg] = useState('');
+-   const [byeWeeksByTeam, setByeWeeksByTeam] = useState({});
+-+  const [scheduleByTeam, setScheduleByTeam] = useState({});
+-   const [leagueRosterSpec, setLeagueRosterSpec] = useState(null);
+-   const [currentWeek, setCurrentWeek] = useState(1);
+-   const [rankedPlayers, setRankedPlayers] = useState([]);
+-@@ -370,7 +383,7 @@ export default function DraftRoom({ league, profile, onBack }) {
+-   const [allWonPlayers, setAllWonPlayers] = useState([]);
+-   const [signingsLoaded, setSigningsLoaded] = useState(false);
+-   const [leagueTeams, setLeagueTeams] = useState([]);
+--  const [viewingTeamName, setViewingTeamName] = useState(null);
+-+  const [viewingTeamId, setViewingTeamId] = useState(null);
+-   const [crestData, setCrestData] = useState({ pattern: 'vertical', color1: '#888888', color2: '#ffffff' });
+-   const [teamName, setTeamName] = useState('My Team');
+-   const [error, setError] = useState('');
+-@@ -447,42 +460,54 @@ export default function DraftRoom({ league, profile, onBack }) {
+-       });
+-   }, [league]);
+- 
+--  // Every team in this league, paired with its owner's crest. Both tables are
+--  // publicly readable, so this is the one fetch that lets the board show whose
+--  // shield is actually on a nomination, a bid, or a won player — previously
+--  // every team but your own fell back to an anonymous grey shield.
+--  useEffect(() => {
+-+  // Every team in this league, with its current name and its owner's crest.
+-+  // Both tables are publicly readable, so this one fetch is what lets the board
+-+  // show whose shield is on a nomination, a bid or a won player — and it is
+-+  // also the live source for team *names*, which the draft session only ever
+-+  // stored as a snapshot taken at the moment of the bid.
+-+  async function loadLeagueTeams() {
+-     if (!league) return;
+--    let cancelled = false;
+--    supabase
+-+    const { data: teamRows, error: teamsErr } = await supabase
+-       .from('teams')
+-       .select('id, team_name, owner_id')
+--      .eq('league_id', league.league_id)
+--      .then(({ data: teamRows, error: teamsErr }) => {
+--        if (cancelled) return;
+--        if (teamsErr) { console.error('team crest fetch failed:', teamsErr); return; }
+--        const rows = teamRows || [];
+--        const ownerIds = rows.map((t) => t.owner_id).filter(Boolean);
+--        if (ownerIds.length === 0) { setLeagueTeams(rows.map((t) => ({ ...t, crest: null }))); return; }
+--        supabase
+--          .from('profiles')
+--          .select('id, crest_pattern, crest_color1, crest_color2')
+--          .in('id', ownerIds)
+--          .then(({ data: profileRows, error: profErr }) => {
+--            if (cancelled) return;
+--            if (profErr) { console.error('crest profile fetch failed:', profErr); }
+--            const crestByOwner = {};
+--            (profileRows || []).forEach((p) => {
+--              crestByOwner[p.id] = {
+--                pattern: p.crest_pattern || 'vertical',
+--                color1: p.crest_color1 || '#888888',
+--                color2: p.crest_color2 || '#ffffff',
+--              };
+--            });
+--            setLeagueTeams(rows.map((t) => ({ ...t, crest: crestByOwner[t.owner_id] || null })));
+--          });
+--      });
+--    return () => { cancelled = true; };
+-+      .eq('league_id', league.league_id);
+-+    if (teamsErr) { console.error('league team fetch failed:', teamsErr); return; }
+-+    const rows = teamRows || [];
+-+
+-+    const myRow = rows.find((t) => Number(t.id) === Number(league.team_id));
+-+    if (myRow && myRow.team_name) setTeamName(myRow.team_name);
+-+
+-+    const ownerIds = rows.map((t) => t.owner_id).filter(Boolean);
+-+    if (ownerIds.length === 0) { setLeagueTeams(rows.map((t) => ({ ...t, crest: null }))); return; }
+-+
+-+    const { data: profileRows, error: profErr } = await supabase
+-+      .from('profiles')
+-+      .select('id, crest_pattern, crest_color1, crest_color2')
+-+      .in('id', ownerIds);
+-+    if (profErr) console.error('crest profile fetch failed:', profErr);
+-+    const crestByOwner = {};
+-+    (profileRows || []).forEach((p) => {
+-+      crestByOwner[p.id] = {
+-+        pattern: p.crest_pattern || 'vertical',
+-+        color1: p.crest_color1 || '#888888',
+-+        color2: p.crest_color2 || '#ffffff',
+-+      };
+-+    });
+-+    setLeagueTeams(rows.map((t) => ({ ...t, crest: crestByOwner[t.owner_id] || null })));
+-+  }
+-+
+-+  // `teams` is in the realtime publication, so a rename anywhere reaches every
+-+  // browser in the room without a refresh.
+-+  useEffect(() => {
+-+    if (!league) return;
+-+    loadLeagueTeams();
+-+    const channel = supabase.channel(`league_teams_${league.league_id}`)
+-+      .on('postgres_changes', {
+-+        event: '*', schema: 'public', table: 'teams', filter: `league_id=eq.${league.league_id}`,
+-+      }, () => { loadLeagueTeams(); })
+-+      .subscribe();
+-+    return () => { supabase.removeChannel(channel); };
+-+    // eslint-disable-next-line react-hooks/exhaustive-deps
+-   }, [league]);
+- 
+-   // Ticking clock drives countdown displays and all phase resolution
+-@@ -542,6 +567,26 @@ useEffect(() => {
+-     const withTeams = data || [];
+-     setRankedPlayers(withTeams);
+- 
+-+    // The whole season's fixtures in one go — `games` is publicly readable, so
+-+    // this needs no RPC. Keyed by team then week, it turns into the "vs KC" /
+-+    // "@ KC" line under each week's price without a lookup per player.
+-+    supabase
+-+      .from('games')
+-+      .select('week, home_team, away_team')
+-+      .eq('season', 2026)
+-+      .eq('season_type', 'REG')
+-+      .then(({ data: gameRows, error: gamesErr }) => {
+-+        if (gamesErr) { console.error('Schedule fetch failed:', gamesErr); return; }
+-+        const byTeam = {};
+-+        (gameRows || []).forEach((g) => {
+-+          if (!byTeam[g.home_team]) byTeam[g.home_team] = {};
+-+          if (!byTeam[g.away_team]) byTeam[g.away_team] = {};
+-+          byTeam[g.home_team][g.week] = { opponent: g.away_team, isHome: true };
+-+          byTeam[g.away_team][g.week] = { opponent: g.home_team, isHome: false };
+-+        });
+-+        setScheduleByTeam(byTeam);
+-+      });
+-+
+-     supabase.rpc('get_team_bye_weeks', { p_season: 2026 }).then(({ data: byeRows, error: byeErr }) => {
+-       if (byeErr) { console.error('Bye week fetch failed:', byeErr); return; }
+-       const byTeam = {};
+-@@ -618,6 +663,16 @@ useEffect(() => {
+-     return { pattern: 'solid', color1: '#888888', color2: '#888888' };
+-   }
+- 
+-+  // The session stores whatever a team was called when it bid, so a rename
+-+  // mid-draft would otherwise leave stale names on the board. Prefer the live
+-+  // name from `teams`, and fall back to the snapshot only for a team we
+-+  // haven't loaded.
+-+  function teamNameFor(teamId, fallbackTeamName) {
+-+    if (teamId === null || teamId === undefined) return fallbackTeamName || '';
+-+    const match = leagueTeams.find((t) => Number(t.id) === Number(teamId));
+-+    return (match && match.team_name) || fallbackTeamName || '';
+-+  }
+-+
+-   function statsRowFor(player, view) {
+-     if (view === 'current') return seasonStats2025[player.sleeper_id] || null;
+-     if (view === 'previous') return seasonStats2024[player.sleeper_id] || null;
+-@@ -725,7 +780,7 @@ useEffect(() => {
+-     setMyWeeksInputs((prev) => ({ ...prev, [key]: String(weeksEntered) }));
+-   }
+- 
+--  function buildMyRosterSlots() {
+-+  function buildRosterSlotsForTeam(teamId) {
+-     if (!leagueRosterSpec) return [];
+-     const positionCounts = [
+-       ['QB', leagueRosterSpec.roster_qb], ['RB', leagueRosterSpec.roster_rb],
+-@@ -733,37 +788,7 @@ useEffect(() => {
+-       ['FL', leagueRosterSpec.roster_flex], ['SF', leagueRosterSpec.roster_superflex],
+-       ['BE', leagueRosterSpec.roster_bench],
+-     ];
+--    const byPosition = { QB: [], RB: [], WR: [], TE: [] };
+--    wonPlayers.forEach((w) => { if (byPosition[w.player.player_position]) byPosition[w.player.player_position].push(w); });
+--    const used = new Set();
+--    const rosterSlots = [];
+--    for (const [pos, count] of positionCounts) {
+--      for (let i = 0; i < (count || 0); i++) {
+--        let won = null;
+--        if (['QB', 'RB', 'WR', 'TE'].includes(pos)) {
+--          won = byPosition[pos].find((w) => !used.has(w.player.sleeper_id)) || null;
+--        } else if (pos === 'FL') {
+--          won = ['RB', 'WR', 'TE'].flatMap((p) => byPosition[p]).find((w) => !used.has(w.player.sleeper_id)) || null;
+--        } else {
+--          // SF and BE accept any position, including QB
+--          won = wonPlayers.find((w) => !used.has(w.player.sleeper_id)) || null;
+--        }
+--        if (won) used.add(won.player.sleeper_id);
+--        rosterSlots.push({ position: pos, won });
+--      }
+--    }
+--    return rosterSlots;
+--  }
+--
+--  function buildRosterSlotsForTeam(teamName) {
+--    if (!leagueRosterSpec) return [];
+--    const positionCounts = [
+--      ['QB', leagueRosterSpec.roster_qb], ['RB', leagueRosterSpec.roster_rb],
+--      ['WR', leagueRosterSpec.roster_wr], ['TE', leagueRosterSpec.roster_te],
+--      ['FL', leagueRosterSpec.roster_flex], ['SF', leagueRosterSpec.roster_superflex],
+--      ['BE', leagueRosterSpec.roster_bench],
+--    ];
+--    const teamPicks = allWonPlayers.filter((w) => w.teamName === teamName);
+-+    const teamPicks = allWonPlayers.filter((w) => Number(w.teamId) === Number(teamId));
+-     const byPosition = { QB: [], RB: [], WR: [], TE: [] };
+-     teamPicks.forEach((w) => { if (byPosition[w.player.player_position]) byPosition[w.player.player_position].push(w); });
+-     const used = new Set();
+-@@ -786,9 +811,9 @@ useEffect(() => {
+-     return rosterSlots;
+-   }
+- 
+--  function totalSpentByTeam(teamName) {
+-+  function totalSpentByTeam(teamId) {
+-     return allWonPlayers
+--      .filter((w) => w.teamName === teamName)
+-+      .filter((w) => Number(w.teamId) === Number(teamId))
+-       .reduce((sum, w) => sum + costAtWeekWithBye(w.baseValue, w.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[w.player.team]), 0);
+-   }
+- 
+-@@ -1148,8 +1173,10 @@ useEffect(() => {
+-             style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}
+-             onClick={() => setShowTeamDropdown((v) => !v)}
+-           >
+--            <Crest {...crestFor(null, viewingTeamName || teamName)} size={36} />
+--            <span style={{ fontWeight: 'bold' }}>{viewingTeamName || teamName} ▾</span>
+-+            <Crest {...crestFor(viewingTeamId ?? league?.team_id, teamName)} size={36} />
+-+            <span style={{ fontWeight: 'bold' }}>
+-+              {teamNameFor(viewingTeamId ?? league?.team_id, teamName)} ▾
+-+            </span>
+-           </div>
+-           <div style={{ display: 'flex', gap: 6 }}>
+-             <button
+-@@ -1182,7 +1209,7 @@ useEffect(() => {
+-                     display: 'block', width: '100%', textAlign: 'left', marginBottom: 8,
+-                     background: 'var(--color-success)', color: '#111', fontWeight: 'bold',
+-                   }}
+--                  onClick={() => { setViewingTeamName(null); setShowTeamDropdown(false); }}
+-+                  onClick={() => { setViewingTeamId(null); setShowTeamDropdown(false); }}
+-                 >
+-                   {teamName} (You)
+-                 </button>
+-@@ -1191,17 +1218,17 @@ useEffect(() => {
+-                     <div className="muted-text" style={{ fontSize: '0.75rem', color: t.tier_color || 'var(--color-text-muted)' }}>
+-                       {t.tier_name || `Tier ${t.tier_number}`}
+-                     </div>
+--                    {(t.teams || []).filter((team) => team.team_name !== teamName).map((team) => (
+-+                    {(t.teams || []).filter((team) => Number(team.team_id) !== Number(league?.team_id)).map((team) => (
+-                       <button
+-                         key={team.team_id}
+-                         style={{
+-                           display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left',
+-                           background: t.tier_color || 'var(--color-button-bg)', marginTop: 2,
+-                         }}
+--                        onClick={() => { setViewingTeamName(team.team_name === teamName ? null : team.team_name); setShowTeamDropdown(false); }}
+-+                        onClick={() => { setViewingTeamId(team.team_id); setShowTeamDropdown(false); }}
+-                       >
+-                         <Crest {...crestFor(team.team_id, team.team_name)} size={18} />
+--                        {team.team_name}
+-+                        {teamNameFor(team.team_id, team.team_name)}
+-                       </button>
+-                     ))}
+-                   </div>
+-@@ -1213,7 +1240,7 @@ useEffect(() => {
+- 
+-         <div className="muted-text" style={{ fontSize: '0.75rem', marginTop: 6 }}>
+-           Cap Remaining: <span style={{ color: 'var(--color-success)', fontWeight: 'bold' }}>
+--            ${Math.max(0, salaryCap - totalSpentByTeam(viewingTeamName || teamName)).toFixed(2)}
+-+            ${Math.max(0, salaryCap - totalSpentByTeam(viewingTeamId ?? league?.team_id)).toFixed(2)}
+-           </span>
+-         </div>
+- 
+-@@ -1223,7 +1250,7 @@ useEffect(() => {
+-             <span className="muted-text" style={{ fontSize: '0.7rem' }}>Player</span>
+-             <span className="muted-text" style={{ fontSize: '0.7rem' }}>Cost</span>
+-           </div>
+--          {(viewingTeamName && viewingTeamName !== teamName ? buildRosterSlotsForTeam(viewingTeamName) : buildMyRosterSlots()).map((slot, i) => {
+-+          {buildRosterSlotsForTeam(viewingTeamId ?? league?.team_id).map((slot, i) => {
+-             const cost = slot.won ? costAtWeekWithBye(slot.won.baseValue, slot.won.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[slot.won.player.team]) : null;
+-             return (
+-               <div key={i} style={{ display: 'grid', gridTemplateColumns: '45px 1fr 55px', gap: 4, alignItems: 'center', padding: '4px 0', borderBottom: '1px solid var(--color-border-subtle)' }}>
+-@@ -1261,7 +1288,7 @@ useEffect(() => {
+-                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 16 }}>
+-                     <Crest {...crestFor(teamTurnOrder[0].teamId, teamTurnOrder[0].name)} size={28} />
+-                     <span style={{ color: 'var(--color-error)', fontWeight: 'bold' }}>
+--                      {teamTurnOrder[0].name} will be up first
+-+                      {teamNameFor(teamTurnOrder[0].teamId, teamTurnOrder[0].name)} will be up first
+-                     </span>
+-                   </div>
+-                 )}
+-@@ -1335,19 +1362,25 @@ useEffect(() => {
+-       {s.player.player_position} – {s.player.team}
+-     </div>
+-     <div className="muted-text" style={{ fontSize: '0.8rem', marginTop: 4 }}>
+--      <div>Wk {currentWeek}: —</div>
+--      <div>Wk {currentWeek + 1}: —</div>
+--      <div>Wk {currentWeek + 2}: —</div>
+-+      {[0, 1, 2].map((offset) => {
+-+        const wk = currentWeek + offset;
+-+        const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+-+        return (
+-+          <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-+            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
+-+          </div>
+-+        );
+-+      })}
+-     </div>
+-     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
+-       <Crest {...crestFor(s.teamId, s.teamName)} size={22} />
+--      <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.teamName}</span>
+-+      <span className="muted-text" style={{ fontSize: '0.8rem' }}>{teamNameFor(s.teamId, s.teamName)}</span>
+-     </div>
+-   </>
+- ) : (
+-                   <>
+-                     <Crest {...crestFor(s.teamId, s.teamName)} size={50} />
+--                    <div style={{ fontWeight: 'bold', marginTop: 8 }}>{s.teamName}</div>
+-+                    <div style={{ fontWeight: 'bold', marginTop: 8 }}>{teamNameFor(s.teamId, s.teamName)}</div>
+-                     <div className="muted-text" style={{ fontSize: '0.75rem' }}>{s.isMe ? 'Your pick' : 'choosing...'}</div>
+-                   </>
+-                 )}
+-@@ -1377,7 +1410,7 @@ useEffect(() => {
+-                 <div style={{ fontWeight: 'bold', marginTop: 8 }}>{w.player.full_name}</div>
+-                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }}>
+-                   <Crest {...crestFor(w.teamId, w.teamName)} size={32} />
+--                  <span className="muted-text" style={{ fontSize: '0.85rem' }}>{w.teamName}</span>
+-+                  <span className="muted-text" style={{ fontSize: '0.85rem' }}>{teamNameFor(w.teamId, w.teamName)}</span>
+-                 </div>
+-                 <div style={{ color: 'var(--color-success)', fontWeight: 'bold', marginTop: 8 }}>${w.amount}</div>
+-               </div>
+-@@ -1406,7 +1439,7 @@ useEffect(() => {
+-                     }}
+-                   >
+-                     <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={sizing.imgSize * 0.4} />
+--                    <div style={{ fontWeight: 'bold', marginTop: 6 }}>{s.highBidderTeamName}</div>
+-+                    <div style={{ fontWeight: 'bold', marginTop: 6 }}>{teamNameFor(s.highBidderTeamId, s.highBidderTeamName)}</div>
+-                     <div className="muted-text" style={{ fontSize: sizing.statSize }}>{s.player.full_name}</div>
+-                     <div style={{ color: 'var(--color-success)', fontWeight: 'bold', marginTop: 4 }}>${s.highBid}</div>
+-                   </div>
+-@@ -1441,7 +1474,7 @@ useEffect(() => {
+-                           <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={40} />
+-                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+-                           {s.highBidderTeamName && (
+--                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.highBidderTeamName}</span>
+-+                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{teamNameFor(s.highBidderTeamId, s.highBidderTeamName)}</span>
+-                           )}
+-                         </div>
+- 
+-@@ -1611,16 +1644,22 @@ useEffect(() => {
+-                     })()
+-                   ) : (
+-                     <div className="muted-text" style={{ fontSize: sizing.statSize, marginTop: 4 }}>
+--                      <div>Wk {currentWeek}: ${projectedValue.toFixed(2)}</div>
+--                      <div>Wk {currentWeek + 1}: ${(projectedValue * 1.0123).toFixed(2)}</div>
+--                      <div>Wk {currentWeek + 2}: ${(projectedValue * Math.pow(1.0123, 2)).toFixed(2)}</div>
+--                      <div>Wk {currentWeek + 3}: ${(projectedValue * Math.pow(1.0123, 3)).toFixed(2)}</div>
+-+                      {[0, 1, 2, 3].map((offset) => {
+-+                        const wk = currentWeek + offset;
+-+                        const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+-+                        return (
+-+                          <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-+                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+-+                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
+-+                          </div>
+-+                        );
+-+                      })}
+-                     </div>
+-                   )}
+- 
+-                   <div
+-                     style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8 }}
+--                    title={s.highBidderTeamName ? `Leading bid: ${s.highBidderTeamName}` : 'No bids yet'}
+-+                    title={s.highBidderTeamName ? `Leading bid: ${teamNameFor(s.highBidderTeamId, s.highBidderTeamName)}` : 'No bids yet'}
+-                   >
+-                     <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={34} />
+-                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+-diff --git a/web/src/pages/Home.jsx b/web/src/pages/Home.jsx
+-index 17cecc2..bfccd38 100644
+---- a/web/src/pages/Home.jsx
+-+++ b/web/src/pages/Home.jsx
+-@@ -3,6 +3,10 @@ import { supabase } from '../supabaseClient';
+- import geeklyLogo from '../assets/final-logo-geekly.png';
+- const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
+- 
+-+// Team names sit in narrow columns all over the app — the roster panel, the
+-+// draft board, the standings table — so they need a ceiling.
+-+const MAX_TEAM_NAME_LENGTH = 20;
+-+
+- function Crest({ pattern, color1, color2, size = 40, onClick, title, empty = false }) {
+-   const clipId = `shield-clip-${pattern}-${(color1 || '').replace('#', '')}-${(color2 || '').replace('#', '')}`;
+-   return (
+-@@ -732,10 +736,16 @@ function minutesUntilAuction() {
+- 
+-   async function handleSaveTeamIdentity() {
+-     setTeamIdentityMsg('');
+-+    const trimmedName = editTeamName.trim();
+-+    if (!trimmedName) { setTeamIdentityMsg('Team name cannot be empty.'); return; }
+-+    if (trimmedName.length > MAX_TEAM_NAME_LENGTH) {
+-+      setTeamIdentityMsg(`Team name must be ${MAX_TEAM_NAME_LENGTH} characters or fewer.`);
+-+      return;
+-+    }
+-     const { error } = await supabase.rpc('update_team_identity', {
+-       p_team_id: activeLeague.team_id,
+--      p_team_name: editTeamName,
+--      p_team_abbr: editTeamAbbr,
+-+      p_team_name: trimmedName,
+-+      p_team_abbr: editTeamAbbr.trim(),
+-     });
+-     if (error) { setTeamIdentityMsg(error.message); return; }
+-     setEditingTeamIdentity(false);
+-@@ -1436,7 +1446,17 @@ function minutesUntilAuction() {
+-                     <span style={{ fontWeight: 'bold', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block', maxWidth: '100%' }}>{activeLeague.team_name}</span>
+-                   ) : (
+-                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+--                      <input type="text" value={editTeamName} onChange={(e) => setEditTeamName(e.target.value)} style={{ width: 110 }} />
+-+                      <input
+-+                        type="text"
+-+                        value={editTeamName}
+-+                        maxLength={MAX_TEAM_NAME_LENGTH}
+-+                        onChange={(e) => setEditTeamName(e.target.value)}
+-+                        title={`Up to ${MAX_TEAM_NAME_LENGTH} characters`}
+-+                        style={{ width: 110 }}
+-+                      />
+-+                      <span className="muted-text" style={{ fontSize: '0.7rem' }}>
+-+                        {editTeamName.length}/{MAX_TEAM_NAME_LENGTH}
+-+                      </span>
+-                       <input type="text" value={editTeamAbbr} maxLength={3} onChange={(e) => setEditTeamAbbr(e.target.value.toUpperCase())} style={{ width: 44, textAlign: 'center' }} />
+-                     </div>
+-                   )}
+--- 
+-2.43.0
+-
+diff --git a/web/src/draftControls.jsx b/web/src/draftControls.jsx
+new file mode 100644
+index 0000000..ed8f30a
+--- /dev/null
++++ b/web/src/draftControls.jsx
+@@ -0,0 +1,99 @@
++// Pieces shared by the live Draft Room and the Mock Draft. Both screens run
++// the same auction UI, so anything that governs how a bid is entered or how a
++// week's fixture is written belongs here rather than being copied into each.
++
++export const MAX_CONTRACT_WEEKS = 18; // no real "max contract length" setting exists yet — hardcoded per spec
++export const MIN_BID = 1; // a team with less than this left for the week can't sign anyone else
++
++export const STEPPER_BUTTON_STYLE = {
++  width: 22, height: 22, padding: 0, borderRadius: '50%', lineHeight: 1,
++  background: 'var(--color-button-bg)', border: '1px solid var(--color-border)',
++  color: 'var(--color-text)', fontWeight: 'bold', flex: '0 0 auto',
++};
++
++// Bidding without having to type: the amount defaults to the smallest bid that
++// would take the lead, +/- nudge it a dollar or a week at a time, and the
++// button says what it will actually cost. The number fields still accept
++// typing for anyone who'd rather jump straight to a figure.
++export function BidControls({
++  amountValue, weeksValue, highBid, capMax, isLeading, statSize, compact,
++  onAmountChange, onWeeksChange, onSubmit,
++}) {
++  const minimumBid = highBid + MIN_BID;
++  const nextBid = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
++  const weeks = Number(weeksValue) > 0 ? Number(weeksValue) : 1;
++  const canBid = !isLeading && nextBid > highBid && nextBid <= capMax;
++
++  const nudgeAmount = (delta) => {
++    const base = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
++    onAmountChange(String(Math.max(0, Math.min(capMax, base + delta))));
++  };
++  const nudgeWeeks = (delta) => {
++    onWeeksChange(String(Math.max(1, Math.min(MAX_CONTRACT_WEEKS, weeks + delta))));
++  };
++
++  const row = { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 };
++
++  return (
++    <div style={{ width: '100%' }}>
++      <div style={{ ...row, marginTop: 8, flexWrap: 'wrap', columnGap: 3 }}>
++        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
++        <span>$</span>
++        <input
++          type="number"
++          disabled={isLeading}
++          value={amountValue}
++          placeholder={String(minimumBid)}
++          onChange={(e) => {
++            const raw = e.target.value;
++            onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
++          }}
++          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
++          style={{ width: compact ? 46 : 62, padding: '2px 4px', textAlign: 'center' }}
++        />
++        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
++
++        <span style={{ width: 6, flex: '0 0 auto' }} />
++
++        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
++        <input
++          type="number"
++          disabled={isLeading}
++          value={weeksValue}
++          placeholder="1"
++          onChange={(e) => onWeeksChange(e.target.value)}
++          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
++          style={{ width: compact ? 36 : 48, padding: '2px 4px', textAlign: 'center' }}
++        />
++        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
++        <span style={{ fontSize: statSize, color: '#fff' }}>
++          {compact ? (weeks === 1 ? 'wk' : 'wks') : (weeks === 1 ? 'week' : 'weeks')}
++        </span>
++      </div>
++
++      <button
++        disabled={!canBid}
++        onClick={() => onSubmit(nextBid, weeks)}
++        style={{
++          marginTop: 8, width: '100%', border: '3px solid white',
++          background: isLeading ? 'var(--color-success)' : 'var(--color-button-bg)',
++          color: isLeading ? '#111' : 'var(--color-text)', fontWeight: 'bold',
++        }}
++      >
++        {isLeading ? 'Leading' : `Bid $${nextBid}`}
++      </button>
++    </div>
++  );
++}
++
++// "vs KC" at home, "@ KC" away, "BYE" on a bye week. Empty string when the
++// schedule hasn't loaded yet or the player has no NFL team, so the caller can
++// render the price on its own rather than a placeholder.
++export function formatMatchup(scheduleByTeam, nflTeam, week) {
++  if (!nflTeam) return '';
++  const teamGames = scheduleByTeam[nflTeam];
++  if (!teamGames) return '';
++  const game = teamGames[week];
++  if (!game) return 'BYE';
++  return `${game.isHome ? 'vs' : '@'} ${game.opponent}`;
++}
+diff --git a/web/src/pages/DraftRoom.jsx b/web/src/pages/DraftRoom.jsx
+index 4941e84..3e4f642 100644
+--- a/web/src/pages/DraftRoom.jsx
++++ b/web/src/pages/DraftRoom.jsx
+@@ -1,5 +1,6 @@
+ import { Fragment, useEffect, useRef, useState } from 'react';
+ import { supabase } from '../supabaseClient';
++import { BidControls, formatMatchup, MAX_CONTRACT_WEEKS, MIN_BID } from '../draftControls';
+ 
+ const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
+ 
+@@ -24,11 +25,9 @@ const POSITION_ROW_TINT = {
+   TE: 'rgba(205, 127, 50, 0.12)',  // bronze, toned down
+ };
+ 
+-const MAX_CONTRACT_WEEKS = 18; // no real "max contract length" setting exists yet — hardcoded per spec
+ const NOMINATION_SECONDS = 20;
+ const AUTO_START_RETRY_MS = 10000;
+ const END_CHECK_RETRY_MS = 10000;
+-const MIN_BID = 1; // a team with less than this left for the week can't sign anyone else
+ const CPU_NOMINATE_DELAY_MS = 1000;
+ const WINNERS_DISPLAY_MS = 2000;
+ 
+@@ -69,99 +68,6 @@ function Crest({ pattern, color1, color2, size = 28, onClick }) {
+   );
+ }
+ 
+-const STEPPER_BUTTON_STYLE = {
+-  width: 22, height: 22, padding: 0, borderRadius: '50%', lineHeight: 1,
+-  background: 'var(--color-button-bg)', border: '1px solid var(--color-border)',
+-  color: 'var(--color-text)', fontWeight: 'bold', flex: '0 0 auto',
+-};
+-
+-// Bidding without having to type: the amount defaults to the smallest bid that
+-// would take the lead, +/- nudge it a dollar or a week at a time, and the
+-// button says what it will actually cost. The number fields still accept
+-// typing for anyone who'd rather jump straight to a figure.
+-function BidControls({
+-  amountValue, weeksValue, highBid, capMax, isLeading, statSize, compact,
+-  onAmountChange, onWeeksChange, onSubmit,
+-}) {
+-  const minimumBid = highBid + MIN_BID;
+-  const nextBid = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+-  const weeks = Number(weeksValue) > 0 ? Number(weeksValue) : 1;
+-  const canBid = !isLeading && nextBid > highBid && nextBid <= capMax;
+-
+-  const nudgeAmount = (delta) => {
+-    const base = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+-    onAmountChange(String(Math.max(0, Math.min(capMax, base + delta))));
+-  };
+-  const nudgeWeeks = (delta) => {
+-    onWeeksChange(String(Math.max(1, Math.min(MAX_CONTRACT_WEEKS, weeks + delta))));
+-  };
+-
+-  const row = { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 };
+-
+-  return (
+-    <div style={{ width: '100%' }}>
+-      <div style={{ ...row, marginTop: 8, flexWrap: 'wrap', columnGap: 3 }}>
+-        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
+-        <span>$</span>
+-        <input
+-          type="number"
+-          disabled={isLeading}
+-          value={amountValue}
+-          placeholder={String(minimumBid)}
+-          onChange={(e) => {
+-            const raw = e.target.value;
+-            onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
+-          }}
+-          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-          style={{ width: compact ? 46 : 62, padding: '2px 4px', textAlign: 'center' }}
+-        />
+-        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
+-
+-        <span style={{ width: 6, flex: '0 0 auto' }} />
+-
+-        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
+-        <input
+-          type="number"
+-          disabled={isLeading}
+-          value={weeksValue}
+-          placeholder="1"
+-          onChange={(e) => onWeeksChange(e.target.value)}
+-          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-          style={{ width: compact ? 36 : 48, padding: '2px 4px', textAlign: 'center' }}
+-        />
+-        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
+-        <span style={{ fontSize: statSize, color: '#fff' }}>
+-          {compact ? (weeks === 1 ? 'wk' : 'wks') : (weeks === 1 ? 'week' : 'weeks')}
+-        </span>
+-      </div>
+-
+-      <button
+-        disabled={!canBid}
+-        onClick={() => onSubmit(nextBid, weeks)}
+-        style={{
+-          marginTop: 8, width: '100%', border: '3px solid white',
+-          background: isLeading ? 'var(--color-success)' : 'var(--color-button-bg)',
+-          color: isLeading ? '#111' : 'var(--color-text)', fontWeight: 'bold',
+-        }}
+-      >
+-        {isLeading ? 'Leading' : `Bid $${nextBid}`}
+-      </button>
+-    </div>
+-  );
+-}
+-
+-// "vs KC" at home, "@ KC" away, "BYE" on a bye week. Empty string when the
+-// schedule hasn't loaded yet or the player has no NFL team, so the caller can
+-// render the price on its own rather than a placeholder.
+-function formatMatchup(scheduleByTeam, nflTeam, week) {
+-  if (!nflTeam) return '';
+-  const teamGames = scheduleByTeam[nflTeam];
+-  if (!teamGames) return '';
+-  const game = teamGames[week];
+-  if (!game) return 'BYE';
+-  return `${game.isHome ? 'vs' : '@'} ${game.opponent}`;
+-}
+-
+ function formatMMSS(totalSeconds) {
+   const m = Math.floor(totalSeconds / 60);
+   const sec = totalSeconds % 60;
+diff --git a/web/src/pages/MockDraft.jsx b/web/src/pages/MockDraft.jsx
+index 90cae8b..79c0617 100644
+--- a/web/src/pages/MockDraft.jsx
++++ b/web/src/pages/MockDraft.jsx
+@@ -1,5 +1,6 @@
+ import { Fragment, useEffect, useRef, useState } from 'react';
+ import { supabase } from '../supabaseClient';
++import { BidControls, formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
+ 
+ const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
+ 
+@@ -24,7 +25,6 @@ const POSITION_ROW_TINT = {
+   TE: 'rgba(205, 127, 50, 0.12)',  // bronze, toned down
+ };
+ 
+-const MAX_CONTRACT_WEEKS = 18; // no real "max contract length" setting exists yet — hardcoded per spec
+ const NOMINATION_SECONDS = 20;
+ const CPU_NOMINATE_DELAY_MS = 1000;
+ const WINNERS_DISPLAY_MS = 2000;
+@@ -236,6 +236,7 @@ export default function MockDraft({ league, profile, onBack }) {
+   const [initialCountdownSeconds, setInitialCountdownSeconds] = useState(120);
+   const [interestRatePerWeek, setInterestRatePerWeek] = useState(0);
+   const [byeWeeksByTeam, setByeWeeksByTeam] = useState({});
++  const [scheduleByTeam, setScheduleByTeam] = useState({});
+   const [leagueRosterSpec, setLeagueRosterSpec] = useState(null);
+   const [bidResetSeconds, setBidResetSeconds] = useState(20);
+   const [currentWeek, setCurrentWeek] = useState(1);
+@@ -339,6 +340,23 @@ function buildNominationRound(order, startIndex, myTeamName) {
+     const withTeams = data || [];
+     setRankedPlayers(withTeams);
+ 
++    supabase
++      .from('games')
++      .select('week, home_team, away_team')
++      .eq('season', 2026)
++      .eq('season_type', 'REG')
++      .then(({ data: gameRows, error: gamesErr }) => {
++        if (gamesErr) { console.error('Schedule fetch failed:', gamesErr); return; }
++        const byTeam = {};
++        (gameRows || []).forEach((g) => {
++          if (!byTeam[g.home_team]) byTeam[g.home_team] = {};
++          if (!byTeam[g.away_team]) byTeam[g.away_team] = {};
++          byTeam[g.home_team][g.week] = { opponent: g.away_team, isHome: true };
++          byTeam[g.away_team][g.week] = { opponent: g.home_team, isHome: false };
++        });
++        setScheduleByTeam(byTeam);
++      });
++
+     supabase.rpc('get_team_bye_weeks', { p_season: 2026 }).then(({ data: byeRows, error: byeErr }) => {
+       if (byeErr) { console.error('Bye week fetch failed:', byeErr); return; }
+       const byTeam = {};
+@@ -580,12 +598,13 @@ function buildNominationRound(order, startIndex, myTeamName) {
+     setHiddenWeeks((prev) => prev.slice(0, -1));
+   }
+ 
+-  function submitBid(key) {
++  function submitBid(key, amountOverride, weeksOverride) {
+     const s = slots.find((row) => row.key === key);
+     if (!s || s.completed) return;
+     if (s.highBidder === 'me') return; // already leading — locked until outbid
+-    const amount = Number(s.myBidAmount);
+-    const weeksEntered = Number(s.myWeeks) > 0 ? Number(s.myWeeks) : 1;
++    const amount = Number(amountOverride ?? s.myBidAmount);
++    const rawWeeks = Number(weeksOverride ?? s.myWeeks);
++    const weeksEntered = rawWeeks > 0 ? rawWeeks : 1;
+     if (!amount || amount <= s.highBid) return;
+ 
+     const violatedWeeks = [];
+@@ -924,9 +943,15 @@ function buildNominationRound(order, startIndex, myTeamName) {
+       {s.player.player_position} – {s.player.team}
+     </div>
+     <div className="muted-text" style={{ fontSize: '0.8rem', marginTop: 4 }}>
+-      <div>Wk {currentWeek}: —</div>
+-      <div>Wk {currentWeek + 1}: —</div>
+-      <div>Wk {currentWeek + 2}: —</div>
++      {[0, 1, 2].map((offset) => {
++        const wk = currentWeek + offset;
++        const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
++        return (
++          <div key={wk} style={{ whiteSpace: 'nowrap' }}>
++            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++          </div>
++        );
++      })}
+     </div>
+     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
+       {s.isMe ? (
+@@ -1047,38 +1072,17 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+                         </div>
+ 
+-                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
+-                          <span>$</span>
+-                          <input
+-                            type="number"
+-                            disabled={isMyBid}
+-                            value={s.myBidAmount}
+-                            onChange={(e) => {
+-                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
+-                              const raw = e.target.value;
+-                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
+-                              updateSlotBidAmount(s.key, clamped);
+-                            }}
+-                            style={{ width: 54 }}
+-                          />
+-                          <span>/</span>
+-                          <input
+-                            type="number"
+-                            disabled={isMyBid}
+-                            value={s.myWeeks}
+-                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
+-                            style={{ width: 44 }}
+-                          />
+-                          <span style={{ color: '#fff' }}>weeks</span>
+-                        </div>
+-
+-                        <button
+-                          disabled={!(Number(s.myBidAmount) > s.highBid)}
+-                          onClick={() => submitBid(s.key)}
+-                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+-                        >
+-                          Submit Bid
+-                        </button>
++                        <BidControls
++                          amountValue={s.myBidAmount}
++                          weeksValue={s.myWeeks}
++                          highBid={s.highBid}
++                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
++                          isLeading={isMyBid}
++                          statSize="0.85rem"
++                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
++                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
++                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
++                        />
+ 
+                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                       </div>
+@@ -1234,10 +1238,16 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                     })()
+                   ) : (
+                     <div className="muted-text" style={{ fontSize: sizing.statSize, marginTop: 4 }}>
+-                      <div>Wk {currentWeek}: ${projectedValue.toFixed(2)}</div>
+-                      <div>Wk {currentWeek + 1}: ${(projectedValue * 1.0123).toFixed(2)}</div>
+-                      <div>Wk {currentWeek + 2}: ${(projectedValue * Math.pow(1.0123, 2)).toFixed(2)}</div>
+-                      <div>Wk {currentWeek + 3}: ${(projectedValue * Math.pow(1.0123, 3)).toFixed(2)}</div>
++                      {[0, 1, 2, 3].map((offset) => {
++                        const wk = currentWeek + offset;
++                        const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
++                        return (
++                          <div key={wk} style={{ whiteSpace: 'nowrap' }}>
++                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
++                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++                          </div>
++                        );
++                      })}
+                     </div>
+                   )}
+ 
+@@ -1250,38 +1260,18 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
+                   </div>
+ 
+-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
+-                    <span>$</span>
+-                    <input
+-                      type="number"
+-                      disabled={isMyBid}
+-                      value={s.myBidAmount}
+-                      onChange={(e) => {
+-                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
+-                        const raw = e.target.value;
+-                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
+-                        updateSlotBidAmount(s.key, clamped);
+-                      }}
+-                      style={{ width: 44, padding: '2px 4px' }}
+-                    />
+-                    <span>/</span>
+-                    <input
+-                      type="number"
+-                      disabled={isMyBid}
+-                      value={s.myWeeks}
+-                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
+-                      style={{ width: 36, padding: '2px 4px' }}
+-                    />
+-                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
+-                  </div>
+-
+-                  <button
+-                    disabled={!(Number(s.myBidAmount) > s.highBid)}
+-                    onClick={() => submitBid(s.key)}
+-                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+-                  >
+-                    Submit Bid
+-                  </button>
++                  <BidControls
++                    compact
++                    amountValue={s.myBidAmount}
++                    weeksValue={s.myWeeks}
++                    highBid={s.highBid}
++                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
++                    isLeading={isMyBid}
++                    statSize={sizing.statSize}
++                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
++                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
++                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
++                  />
+ 
+             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                 </div>
+-- 
+2.43.0
+
+
+From b99a463bd83574ed23fb0b51ebdd2521ea677a4a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 27 Aug 2026 03:05:01 +0000
+Subject: [PATCH 2/2] Restore the original bid controls; show fixture and
+ leading team
+
+Reverts the stepper controls on both the Draft Room and the Mock Draft back
+to the two number fields and the Submit Bid button, restored verbatim from
+the markup they replaced. submitBid still takes optional overrides, so the
+plain call site works unchanged.
+
+The weekly lines now lead with the fixture rather than trailing it:
+
+  Wk 1 (vs KC): $122.70
+  Wk 3 (BYE): $125.74
+
+A week with no schedule loaded falls back to "Wk 1: $122.70" rather than an
+empty bracket.
+
+Each auction card also names the team holding the high bid, beside the crest
+and the amount. It sits inline rather than on its own line so the card keeps
+the height that was making the slot timer crop, and a long name ellipsizes
+instead of wrapping.
+
+BidControls and its stepper styling are gone, since nothing renders them any
+more; draftControls.jsx keeps the fixture formatter both pages share.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Sdnuo56mhnsF6pDMCCDm3h
+---
+ web/src/draftControls.jsx   |  85 +-----------------------------
+ web/src/pages/DraftRoom.jsx |  99 ++++++++++++++++++++++++----------
+ web/src/pages/MockDraft.jsx | 102 ++++++++++++++++++++++++++----------
+ 3 files changed, 149 insertions(+), 137 deletions(-)
+
+diff --git a/web/src/draftControls.jsx b/web/src/draftControls.jsx
+index ed8f30a..061dc22 100644
+--- a/web/src/draftControls.jsx
++++ b/web/src/draftControls.jsx
+@@ -1,91 +1,10 @@
+ // Pieces shared by the live Draft Room and the Mock Draft. Both screens run
+-// the same auction UI, so anything that governs how a bid is entered or how a
+-// week's fixture is written belongs here rather than being copied into each.
++// the same auction board, so anything that governs how a week's fixture is
++// written belongs here rather than being copied into each.
+ 
+ export const MAX_CONTRACT_WEEKS = 18; // no real "max contract length" setting exists yet — hardcoded per spec
+ export const MIN_BID = 1; // a team with less than this left for the week can't sign anyone else
+ 
+-export const STEPPER_BUTTON_STYLE = {
+-  width: 22, height: 22, padding: 0, borderRadius: '50%', lineHeight: 1,
+-  background: 'var(--color-button-bg)', border: '1px solid var(--color-border)',
+-  color: 'var(--color-text)', fontWeight: 'bold', flex: '0 0 auto',
+-};
+-
+-// Bidding without having to type: the amount defaults to the smallest bid that
+-// would take the lead, +/- nudge it a dollar or a week at a time, and the
+-// button says what it will actually cost. The number fields still accept
+-// typing for anyone who'd rather jump straight to a figure.
+-export function BidControls({
+-  amountValue, weeksValue, highBid, capMax, isLeading, statSize, compact,
+-  onAmountChange, onWeeksChange, onSubmit,
+-}) {
+-  const minimumBid = highBid + MIN_BID;
+-  const nextBid = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+-  const weeks = Number(weeksValue) > 0 ? Number(weeksValue) : 1;
+-  const canBid = !isLeading && nextBid > highBid && nextBid <= capMax;
+-
+-  const nudgeAmount = (delta) => {
+-    const base = Number(amountValue) > 0 ? Number(amountValue) : minimumBid;
+-    onAmountChange(String(Math.max(0, Math.min(capMax, base + delta))));
+-  };
+-  const nudgeWeeks = (delta) => {
+-    onWeeksChange(String(Math.max(1, Math.min(MAX_CONTRACT_WEEKS, weeks + delta))));
+-  };
+-
+-  const row = { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 };
+-
+-  return (
+-    <div style={{ width: '100%' }}>
+-      <div style={{ ...row, marginTop: 8, flexWrap: 'wrap', columnGap: 3 }}>
+-        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
+-        <span>$</span>
+-        <input
+-          type="number"
+-          disabled={isLeading}
+-          value={amountValue}
+-          placeholder={String(minimumBid)}
+-          onChange={(e) => {
+-            const raw = e.target.value;
+-            onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
+-          }}
+-          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-          style={{ width: compact ? 46 : 62, padding: '2px 4px', textAlign: 'center' }}
+-        />
+-        <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
+-
+-        <span style={{ width: 6, flex: '0 0 auto' }} />
+-
+-        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
+-        <input
+-          type="number"
+-          disabled={isLeading}
+-          value={weeksValue}
+-          placeholder="1"
+-          onChange={(e) => onWeeksChange(e.target.value)}
+-          onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-          style={{ width: compact ? 36 : 48, padding: '2px 4px', textAlign: 'center' }}
+-        />
+-        <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
+-        <span style={{ fontSize: statSize, color: '#fff' }}>
+-          {compact ? (weeks === 1 ? 'wk' : 'wks') : (weeks === 1 ? 'week' : 'weeks')}
+-        </span>
+-      </div>
+-
+-      <button
+-        disabled={!canBid}
+-        onClick={() => onSubmit(nextBid, weeks)}
+-        style={{
+-          marginTop: 8, width: '100%', border: '3px solid white',
+-          background: isLeading ? 'var(--color-success)' : 'var(--color-button-bg)',
+-          color: isLeading ? '#111' : 'var(--color-text)', fontWeight: 'bold',
+-        }}
+-      >
+-        {isLeading ? 'Leading' : `Bid $${nextBid}`}
+-      </button>
+-    </div>
+-  );
+-}
+-
+ // "vs KC" at home, "@ KC" away, "BYE" on a bye week. Empty string when the
+ // schedule hasn't loaded yet or the player has no NFL team, so the caller can
+ // render the price on its own rather than a placeholder.
+diff --git a/web/src/pages/DraftRoom.jsx b/web/src/pages/DraftRoom.jsx
+index 3e4f642..a37be66 100644
+--- a/web/src/pages/DraftRoom.jsx
++++ b/web/src/pages/DraftRoom.jsx
+@@ -1,6 +1,6 @@
+ import { Fragment, useEffect, useRef, useState } from 'react';
+ import { supabase } from '../supabaseClient';
+-import { BidControls, formatMatchup, MAX_CONTRACT_WEEKS, MIN_BID } from '../draftControls';
++import { formatMatchup, MAX_CONTRACT_WEEKS, MIN_BID } from '../draftControls';
+ 
+ const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
+ 
+@@ -1273,7 +1273,7 @@ useEffect(() => {
+         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+         return (
+           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++            Wk {wk}{matchup && ` (${matchup})`}: —
+           </div>
+         );
+       })}
+@@ -1384,17 +1384,38 @@ useEffect(() => {
+                           )}
+                         </div>
+ 
+-                        <BidControls
+-                          amountValue={s.myBidAmount}
+-                          weeksValue={s.myWeeks}
+-                          highBid={s.highBid}
+-                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-                          isLeading={isMyBid}
+-                          statSize="0.85rem"
+-                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-                        />
++                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
++                          <span>$</span>
++                          <input
++                            type="number"
++                            disabled={isMyBid}
++                            value={s.myBidAmount}
++                            onChange={(e) => {
++                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
++                              const raw = e.target.value;
++                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
++                              updateSlotBidAmount(s.key, clamped);
++                            }}
++                            style={{ width: 54 }}
++                          />
++                          <span>/</span>
++                          <input
++                            type="number"
++                            disabled={isMyBid}
++                            value={s.myWeeks}
++                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
++                            style={{ width: 44 }}
++                          />
++                          <span style={{ color: '#fff' }}>weeks</span>
++                        </div>
++
++                        <button
++                          disabled={!(Number(s.myBidAmount) > s.highBid)}
++                          onClick={() => submitBid(s.key)}
++                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
++                        >
++                          Submit Bid
++                        </button>
+ 
+                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                       </div>
+@@ -1555,8 +1576,7 @@ useEffect(() => {
+                         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+                         return (
+                           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+-                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++                            Wk {wk}{matchup && ` (${matchup})`}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+                           </div>
+                         );
+                       })}
+@@ -1569,20 +1589,45 @@ useEffect(() => {
+                   >
+                     <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={34} />
+                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
++                    {s.highBidderTeamName && (
++                      <span className="muted-text" style={{ fontSize: sizing.statSize, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
++                        {teamNameFor(s.highBidderTeamId, s.highBidderTeamName)}
++                      </span>
++                    )}
+                   </div>
+ 
+-                  <BidControls
+-                    compact
+-                    amountValue={s.myBidAmount}
+-                    weeksValue={s.myWeeks}
+-                    highBid={s.highBid}
+-                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-                    isLeading={isMyBid}
+-                    statSize={sizing.statSize}
+-                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-                  />
++                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
++                    <span>$</span>
++                    <input
++                      type="number"
++                      disabled={isMyBid}
++                      value={s.myBidAmount}
++                      onChange={(e) => {
++                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
++                        const raw = e.target.value;
++                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
++                        updateSlotBidAmount(s.key, clamped);
++                      }}
++                      style={{ width: 44, padding: '2px 4px' }}
++                    />
++                    <span>/</span>
++                    <input
++                      type="number"
++                      disabled={isMyBid}
++                      value={s.myWeeks}
++                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
++                      style={{ width: 36, padding: '2px 4px' }}
++                    />
++                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
++                  </div>
++
++                  <button
++                    disabled={!(Number(s.myBidAmount) > s.highBid)}
++                    onClick={() => submitBid(s.key)}
++                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
++                  >
++                    Submit Bid
++                  </button>
+ 
+             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                 </div>
+diff --git a/web/src/pages/MockDraft.jsx b/web/src/pages/MockDraft.jsx
+index 79c0617..ff88463 100644
+--- a/web/src/pages/MockDraft.jsx
++++ b/web/src/pages/MockDraft.jsx
+@@ -1,6 +1,6 @@
+ import { Fragment, useEffect, useRef, useState } from 'react';
+ import { supabase } from '../supabaseClient';
+-import { BidControls, formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
++import { formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
+ 
+ const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
+ 
+@@ -948,7 +948,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
+         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+         return (
+           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++            Wk {wk}{matchup && ` (${matchup})`}: —
+           </div>
+         );
+       })}
+@@ -1070,19 +1070,43 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                             <Crest pattern="solid" color1="#888888" color2="#888888" size={40} />
+                           )}
+                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
++                          {s.highBidderTeamName && (
++                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.highBidderTeamName}</span>
++                          )}
+                         </div>
+ 
+-                        <BidControls
+-                          amountValue={s.myBidAmount}
+-                          weeksValue={s.myWeeks}
+-                          highBid={s.highBid}
+-                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-                          isLeading={isMyBid}
+-                          statSize="0.85rem"
+-                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-                        />
++                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
++                          <span>$</span>
++                          <input
++                            type="number"
++                            disabled={isMyBid}
++                            value={s.myBidAmount}
++                            onChange={(e) => {
++                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
++                              const raw = e.target.value;
++                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
++                              updateSlotBidAmount(s.key, clamped);
++                            }}
++                            style={{ width: 54 }}
++                          />
++                          <span>/</span>
++                          <input
++                            type="number"
++                            disabled={isMyBid}
++                            value={s.myWeeks}
++                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
++                            style={{ width: 44 }}
++                          />
++                          <span style={{ color: '#fff' }}>weeks</span>
++                        </div>
++
++                        <button
++                          disabled={!(Number(s.myBidAmount) > s.highBid)}
++                          onClick={() => submitBid(s.key)}
++                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
++                        >
++                          Submit Bid
++                        </button>
+ 
+                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                       </div>
+@@ -1243,8 +1267,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                         const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+                         return (
+                           <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+-                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+-                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
++                            Wk {wk}{matchup && ` (${matchup})`}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+                           </div>
+                         );
+                       })}
+@@ -1258,20 +1281,45 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                       <Crest pattern="solid" color1="#888888" color2="#888888" size={34} />
+                     )}
+                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
++                    {s.highBidderTeamName && (
++                      <span className="muted-text" style={{ fontSize: sizing.statSize, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
++                        {s.highBidderTeamName}
++                      </span>
++                    )}
+                   </div>
+ 
+-                  <BidControls
+-                    compact
+-                    amountValue={s.myBidAmount}
+-                    weeksValue={s.myWeeks}
+-                    highBid={s.highBid}
+-                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+-                    isLeading={isMyBid}
+-                    statSize={sizing.statSize}
+-                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+-                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+-                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+-                  />
++                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
++                    <span>$</span>
++                    <input
++                      type="number"
++                      disabled={isMyBid}
++                      value={s.myBidAmount}
++                      onChange={(e) => {
++                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
++                        const raw = e.target.value;
++                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
++                        updateSlotBidAmount(s.key, clamped);
++                      }}
++                      style={{ width: 44, padding: '2px 4px' }}
++                    />
++                    <span>/</span>
++                    <input
++                      type="number"
++                      disabled={isMyBid}
++                      value={s.myWeeks}
++                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
++                      style={{ width: 36, padding: '2px 4px' }}
++                    />
++                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
++                  </div>
++
++                  <button
++                    disabled={!(Number(s.myBidAmount) > s.highBid)}
++                    onClick={() => submitBid(s.key)}
++                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
++                  >
++                    Submit Bid
++                  </button>
+ 
+             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+                 </div>
+-- 
+2.43.0
+
