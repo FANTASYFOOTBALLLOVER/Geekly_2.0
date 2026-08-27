@@ -1,0 +1,69 @@
+From f518075d16e3d1f8ad96a09a04d678101f00a713 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 27 Aug 2026 02:36:09 +0000
+Subject: [PATCH] Keep the bid controls on one row so the slot timer stays
+ visible
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Splitting the amount and the contract length onto separate rows made each
+auction card a row taller than the board has space for, pushing the
+per-slot countdown off the bottom of the panel. Both steppers now share a
+single row — the same height the original two number fields occupied — and
+the row wraps rather than overflowing if a card ever gets narrow enough to
+need it.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Sdnuo56mhnsF6pDMCCDm3h
+---
+ web/src/pages/DraftRoom.jsx | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/web/src/pages/DraftRoom.jsx b/web/src/pages/DraftRoom.jsx
+index e7c99f3..4c9a11e 100644
+--- a/web/src/pages/DraftRoom.jsx
++++ b/web/src/pages/DraftRoom.jsx
+@@ -100,7 +100,7 @@ function BidControls({
+ 
+   return (
+     <div style={{ width: '100%' }}>
+-      <div style={{ ...row, marginTop: 8 }}>
++      <div style={{ ...row, marginTop: 8, flexWrap: 'wrap', columnGap: 3 }}>
+         <button type="button" disabled={isLeading} onClick={() => nudgeAmount(-1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar less">−</button>
+         <span>$</span>
+         <input
+@@ -113,12 +113,12 @@ function BidControls({
+             onAmountChange(raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax)));
+           }}
+           onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-          style={{ width: compact ? 50 : 62, padding: '2px 4px', textAlign: 'center' }}
++          style={{ width: compact ? 46 : 62, padding: '2px 4px', textAlign: 'center' }}
+         />
+         <button type="button" disabled={isLeading} onClick={() => nudgeAmount(1)} style={STEPPER_BUTTON_STYLE} title="Bid a dollar more">+</button>
+-      </div>
+ 
+-      <div style={{ ...row, marginTop: 6 }}>
++        <span style={{ width: 6, flex: '0 0 auto' }} />
++
+         <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(-1)} style={STEPPER_BUTTON_STYLE} title="One week shorter">−</button>
+         <input
+           type="number"
+@@ -127,10 +127,12 @@ function BidControls({
+           placeholder="1"
+           onChange={(e) => onWeeksChange(e.target.value)}
+           onKeyDown={(e) => { if (e.key === 'Enter' && canBid) onSubmit(nextBid, weeks); }}
+-          style={{ width: compact ? 40 : 48, padding: '2px 4px', textAlign: 'center' }}
++          style={{ width: compact ? 36 : 48, padding: '2px 4px', textAlign: 'center' }}
+         />
+         <button type="button" disabled={isLeading} onClick={() => nudgeWeeks(1)} style={STEPPER_BUTTON_STYLE} title="One week longer">+</button>
+-        <span style={{ fontSize: statSize, color: '#fff' }}>{weeks === 1 ? 'week' : 'weeks'}</span>
++        <span style={{ fontSize: statSize, color: '#fff' }}>
++          {compact ? (weeks === 1 ? 'wk' : 'wks') : (weeks === 1 ? 'week' : 'weeks')}
++        </span>
+       </div>
+ 
+       <button
+-- 
+2.43.0
+
