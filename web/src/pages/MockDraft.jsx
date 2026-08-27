@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
 import { supabase } from '../supabaseClient';
+import { BidControls, formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
 
 const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
 
@@ -24,7 +25,6 @@ const POSITION_ROW_TINT = {
   TE: 'rgba(205, 127, 50, 0.12)',  // bronze, toned down
 };
 
-const MAX_CONTRACT_WEEKS = 18; // no real "max contract length" setting exists yet — hardcoded per spec
 const NOMINATION_SECONDS = 20;
 const CPU_NOMINATE_DELAY_MS = 1000;
 const WINNERS_DISPLAY_MS = 2000;
@@ -236,6 +236,7 @@ export default function MockDraft({ league, profile, onBack }) {
   const [initialCountdownSeconds, setInitialCountdownSeconds] = useState(120);
   const [interestRatePerWeek, setInterestRatePerWeek] = useState(0);
   const [byeWeeksByTeam, setByeWeeksByTeam] = useState({});
+  const [scheduleByTeam, setScheduleByTeam] = useState({});
   const [leagueRosterSpec, setLeagueRosterSpec] = useState(null);
   const [bidResetSeconds, setBidResetSeconds] = useState(20);
   const [currentWeek, setCurrentWeek] = useState(1);
@@ -338,6 +339,23 @@ function buildNominationRound(order, startIndex, myTeamName) {
     if (fetchError) { setError(fetchError.message); return; }
     const withTeams = data || [];
     setRankedPlayers(withTeams);
+
+    supabase
+      .from('games')
+      .select('week, home_team, away_team')
+      .eq('season', 2026)
+      .eq('season_type', 'REG')
+      .then(({ data: gameRows, error: gamesErr }) => {
+        if (gamesErr) { console.error('Schedule fetch failed:', gamesErr); return; }
+        const byTeam = {};
+        (gameRows || []).forEach((g) => {
+          if (!byTeam[g.home_team]) byTeam[g.home_team] = {};
+          if (!byTeam[g.away_team]) byTeam[g.away_team] = {};
+          byTeam[g.home_team][g.week] = { opponent: g.away_team, isHome: true };
+          byTeam[g.away_team][g.week] = { opponent: g.home_team, isHome: false };
+        });
+        setScheduleByTeam(byTeam);
+      });
 
     supabase.rpc('get_team_bye_weeks', { p_season: 2026 }).then(({ data: byeRows, error: byeErr }) => {
       if (byeErr) { console.error('Bye week fetch failed:', byeErr); return; }
@@ -580,12 +598,13 @@ function buildNominationRound(order, startIndex, myTeamName) {
     setHiddenWeeks((prev) => prev.slice(0, -1));
   }
 
-  function submitBid(key) {
+  function submitBid(key, amountOverride, weeksOverride) {
     const s = slots.find((row) => row.key === key);
     if (!s || s.completed) return;
     if (s.highBidder === 'me') return; // already leading — locked until outbid
-    const amount = Number(s.myBidAmount);
-    const weeksEntered = Number(s.myWeeks) > 0 ? Number(s.myWeeks) : 1;
+    const amount = Number(amountOverride ?? s.myBidAmount);
+    const rawWeeks = Number(weeksOverride ?? s.myWeeks);
+    const weeksEntered = rawWeeks > 0 ? rawWeeks : 1;
     if (!amount || amount <= s.highBid) return;
 
     const violatedWeeks = [];
@@ -924,9 +943,15 @@ function buildNominationRound(order, startIndex, myTeamName) {
       {s.player.player_position} – {s.player.team}
     </div>
     <div className="muted-text" style={{ fontSize: '0.8rem', marginTop: 4 }}>
-      <div>Wk {currentWeek}: —</div>
-      <div>Wk {currentWeek + 1}: —</div>
-      <div>Wk {currentWeek + 2}: —</div>
+      {[0, 1, 2].map((offset) => {
+        const wk = currentWeek + offset;
+        const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+        return (
+          <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
+          </div>
+        );
+      })}
     </div>
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
       {s.isMe ? (
@@ -1047,38 +1072,17 @@ function buildNominationRound(order, startIndex, myTeamName) {
                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
                         </div>
 
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 10 }}>
-                          <span>$</span>
-                          <input
-                            type="number"
-                            disabled={isMyBid}
-                            value={s.myBidAmount}
-                            onChange={(e) => {
-                              const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
-                              const raw = e.target.value;
-                              const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
-                              updateSlotBidAmount(s.key, clamped);
-                            }}
-                            style={{ width: 54 }}
-                          />
-                          <span>/</span>
-                          <input
-                            type="number"
-                            disabled={isMyBid}
-                            value={s.myWeeks}
-                            onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
-                            style={{ width: 44 }}
-                          />
-                          <span style={{ color: '#fff' }}>weeks</span>
-                        </div>
-
-                        <button
-                          disabled={!(Number(s.myBidAmount) > s.highBid)}
-                          onClick={() => submitBid(s.key)}
-                          style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
-                        >
-                          Submit Bid
-                        </button>
+                        <BidControls
+                          amountValue={s.myBidAmount}
+                          weeksValue={s.myWeeks}
+                          highBid={s.highBid}
+                          capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+                          isLeading={isMyBid}
+                          statSize="0.85rem"
+                          onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+                          onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+                          onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+                        />
 
                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
                       </div>
@@ -1234,10 +1238,16 @@ function buildNominationRound(order, startIndex, myTeamName) {
                     })()
                   ) : (
                     <div className="muted-text" style={{ fontSize: sizing.statSize, marginTop: 4 }}>
-                      <div>Wk {currentWeek}: ${projectedValue.toFixed(2)}</div>
-                      <div>Wk {currentWeek + 1}: ${(projectedValue * 1.0123).toFixed(2)}</div>
-                      <div>Wk {currentWeek + 2}: ${(projectedValue * Math.pow(1.0123, 2)).toFixed(2)}</div>
-                      <div>Wk {currentWeek + 3}: ${(projectedValue * Math.pow(1.0123, 3)).toFixed(2)}</div>
+                      {[0, 1, 2, 3].map((offset) => {
+                        const wk = currentWeek + offset;
+                        const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+                        return (
+                          <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
 
@@ -1250,38 +1260,18 @@ function buildNominationRound(order, startIndex, myTeamName) {
                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
                   </div>
 
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 8 }}>
-                    <span>$</span>
-                    <input
-                      type="number"
-                      disabled={isMyBid}
-                      value={s.myBidAmount}
-                      onChange={(e) => {
-                        const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
-                        const raw = e.target.value;
-                        const clamped = raw === '' ? '' : String(Math.min(Number(raw) || 0, capMax));
-                        updateSlotBidAmount(s.key, clamped);
-                      }}
-                      style={{ width: 44, padding: '2px 4px' }}
-                    />
-                    <span>/</span>
-                    <input
-                      type="number"
-                      disabled={isMyBid}
-                      value={s.myWeeks}
-                      onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
-                      style={{ width: 36, padding: '2px 4px' }}
-                    />
-                    <span style={{ fontSize: sizing.statSize, color: '#fff' }}>weeks</span>
-                  </div>
-
-                  <button
-                    disabled={!(Number(s.myBidAmount) > s.highBid)}
-                    onClick={() => submitBid(s.key)}
-                    style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
-                  >
-                    Submit Bid
-                  </button>
+                  <BidControls
+                    compact
+                    amountValue={s.myBidAmount}
+                    weeksValue={s.myWeeks}
+                    highBid={s.highBid}
+                    capMax={Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key))}
+                    isLeading={isMyBid}
+                    statSize={sizing.statSize}
+                    onAmountChange={(v) => updateSlotBidAmount(s.key, v)}
+                    onWeeksChange={(v) => updateSlotWeeks(s.key, v)}
+                    onSubmit={(amount, weeks) => submitBid(s.key, amount, weeks)}
+                  />
 
             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
                 </div>
