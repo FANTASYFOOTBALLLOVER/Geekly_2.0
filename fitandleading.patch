@@ -1,0 +1,94 @@
+diff --git a/web/src/pages/DraftRoom.jsx b/web/src/pages/DraftRoom.jsx
+index a37be66..d654391 100644
+--- a/web/src/pages/DraftRoom.jsx
++++ b/web/src/pages/DraftRoom.jsx
+@@ -1069,9 +1069,9 @@ useEffect(() => {
+ 
+       {/* My Team box — top right */}
+       <div style={{
+-        width: '27.21%', height: '48.13%', background: 'var(--color-bg-panel)',
++        width: '27.21%', background: 'var(--color-bg-panel)',
+         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
+-        position: 'absolute', top: '3.01%', right: '1.70%', padding: 14, boxSizing: 'border-box',
++        position: 'absolute', top: '3%', bottom: '52%', right: '1.70%', padding: 14, boxSizing: 'border-box',
+         overflowY: 'auto',
+       }}>
+         <div style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+@@ -1173,9 +1173,9 @@ useEffect(() => {
+ 
+       {/* Auction / nomination board — top left */}
+       <div style={{
+-        width: '66.67%', height: '84.24%', background: 'var(--color-bg-panel)',
++        width: '66.67%', background: 'var(--color-bg-panel)',
+         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
+-        position: 'absolute', top: '3.01%', left: '1.70%', padding: 14, boxSizing: 'border-box',
++        position: 'absolute', top: '3%', bottom: started ? '38%' : '61.5%', left: '1.70%', padding: 14, boxSizing: 'border-box',
+         overflowY: 'auto',
+       }}>
+         {!started ? (
+@@ -1414,7 +1414,7 @@ useEffect(() => {
+                           onClick={() => submitBid(s.key)}
+                           style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+                         >
+-                          Submit Bid
++                          {isMyBid ? 'Leading' : 'Submit Bid'}
+                         </button>
+ 
+                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+@@ -1626,7 +1626,7 @@ useEffect(() => {
+                     onClick={() => submitBid(s.key)}
+                     style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+                   >
+-                    Submit Bid
++                    {isMyBid ? 'Leading' : 'Submit Bid'}
+                   </button>
+ 
+             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+@@ -1641,10 +1641,10 @@ useEffect(() => {
+ 
+       {/* Pie chart grid — bottom right */}
+       <div style={{
+-        width: '27.21%', height: '46.93%', background: 'var(--color-bg-panel)',
++        width: '27.21%', background: 'var(--color-bg-panel)',
+         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
+-        position: 'absolute', bottom: '6.02%', right: '1.70%', padding: 10, boxSizing: 'border-box',
+-        display: 'flex', flexDirection: 'column', gap: 4,
++        position: 'absolute', top: '50%', bottom: '3%', right: '1.70%', padding: 10, boxSizing: 'border-box',
++        display: 'flex', flexDirection: 'column', gap: 4, overflow: 'hidden',
+       }}>
+         {(() => {
+           const visibleWeeks = weekNumbers.filter((w) => !hiddenWeeks.includes(w));
+@@ -1725,9 +1725,9 @@ useEffect(() => {
+ 
+       {/* Undrafted players — bottom left */}
+       <div style={{
+-        width: '66.67%', height: started ? '39.71%' : '74.61%', background: 'var(--color-bg-panel)',
++        width: '66.67%', background: 'var(--color-bg-panel)',
+         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
+-        position: 'absolute', bottom: '3.01%', left: '1.70%', padding: 14, boxSizing: 'border-box',
++        position: 'absolute', top: started ? '63.5%' : '40%', bottom: '3%', left: '1.70%', padding: 14, boxSizing: 'border-box',
+         overflowY: 'auto',
+       }}>
+         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+diff --git a/web/src/pages/MockDraft.jsx b/web/src/pages/MockDraft.jsx
+index ff88463..c6eb8b8 100644
+--- a/web/src/pages/MockDraft.jsx
++++ b/web/src/pages/MockDraft.jsx
+@@ -1105,7 +1105,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                           onClick={() => submitBid(s.key)}
+                           style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+                         >
+-                          Submit Bid
++                          {isMyBid ? 'Leading' : 'Submit Bid'}
+                         </button>
+ 
+                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
+@@ -1318,7 +1318,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
+                     onClick={() => submitBid(s.key)}
+                     style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
+                   >
+-                    Submit Bid
++                    {isMyBid ? 'Leading' : 'Submit Bid'}
+                   </button>
+ 
+             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>

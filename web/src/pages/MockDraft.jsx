@@ -1105,7 +1105,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
                           onClick={() => submitBid(s.key)}
                           style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
                         >
-                          Submit Bid
+                          {isMyBid ? 'Leading' : 'Submit Bid'}
                         </button>
 
                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
@@ -1318,7 +1318,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
                     onClick={() => submitBid(s.key)}
                     style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
                   >
-                    Submit Bid
+                    {isMyBid ? 'Leading' : 'Submit Bid'}
                   </button>
 
             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
