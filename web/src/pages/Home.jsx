@@ -3,6 +3,10 @@ import { supabase } from '../supabaseClient';
 import geeklyLogo from '../assets/final-logo-geekly.png';
 const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
 
+// Team names sit in narrow columns all over the app — the roster panel, the
+// draft board, the standings table — so they need a ceiling.
+const MAX_TEAM_NAME_LENGTH = 20;
+
 function Crest({ pattern, color1, color2, size = 40, onClick, title, empty = false }) {
   const clipId = `shield-clip-${pattern}-${(color1 || '').replace('#', '')}-${(color2 || '').replace('#', '')}`;
   return (
@@ -732,10 +736,16 @@ function minutesUntilAuction() {
 
   async function handleSaveTeamIdentity() {
     setTeamIdentityMsg('');
+    const trimmedName = editTeamName.trim();
+    if (!trimmedName) { setTeamIdentityMsg('Team name cannot be empty.'); return; }
+    if (trimmedName.length > MAX_TEAM_NAME_LENGTH) {
+      setTeamIdentityMsg(`Team name must be ${MAX_TEAM_NAME_LENGTH} characters or fewer.`);
+      return;
+    }
     const { error } = await supabase.rpc('update_team_identity', {
       p_team_id: activeLeague.team_id,
-      p_team_name: editTeamName,
-      p_team_abbr: editTeamAbbr,
+      p_team_name: trimmedName,
+      p_team_abbr: editTeamAbbr.trim(),
     });
     if (error) { setTeamIdentityMsg(error.message); return; }
     setEditingTeamIdentity(false);
@@ -1436,7 +1446,17 @@ function minutesUntilAuction() {
                     <span style={{ fontWeight: 'bold', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block', maxWidth: '100%' }}>{activeLeague.team_name}</span>
                   ) : (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <input type="text" value={editTeamName} onChange={(e) => setEditTeamName(e.target.value)} style={{ width: 110 }} />
+                      <input
+                        type="text"
+                        value={editTeamName}
+                        maxLength={MAX_TEAM_NAME_LENGTH}
+                        onChange={(e) => setEditTeamName(e.target.value)}
+                        title={`Up to ${MAX_TEAM_NAME_LENGTH} characters`}
+                        style={{ width: 110 }}
+                      />
+                      <span className="muted-text" style={{ fontSize: '0.7rem' }}>
+                        {editTeamName.length}/{MAX_TEAM_NAME_LENGTH}
+                      </span>
                       <input type="text" value={editTeamAbbr} maxLength={3} onChange={(e) => setEditTeamAbbr(e.target.value.toUpperCase())} style={{ width: 44, textAlign: 'center' }} />
                     </div>
                   )}

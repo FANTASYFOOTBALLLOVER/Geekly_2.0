@@ -150,6 +150,18 @@ function BidControls({
   );
 }
 
+// "vs KC" at home, "@ KC" away, "BYE" on a bye week. Empty string when the
+// schedule hasn't loaded yet or the player has no NFL team, so the caller can
+// render the price on its own rather than a placeholder.
+function formatMatchup(scheduleByTeam, nflTeam, week) {
+  if (!nflTeam) return '';
+  const teamGames = scheduleByTeam[nflTeam];
+  if (!teamGames) return '';
+  const game = teamGames[week];
+  if (!game) return 'BYE';
+  return `${game.isHome ? 'vs' : '@'} ${game.opponent}`;
+}
+
 function formatMMSS(totalSeconds) {
   const m = Math.floor(totalSeconds / 60);
   const sec = totalSeconds % 60;
@@ -363,6 +375,7 @@ export default function DraftRoom({ league, profile, onBack }) {
   const [editableResetSeconds, setEditableResetSeconds] = useState(20);
   const [settingsMsg, setSettingsMsg] = useState('');
   const [byeWeeksByTeam, setByeWeeksByTeam] = useState({});
+  const [scheduleByTeam, setScheduleByTeam] = useState({});
   const [leagueRosterSpec, setLeagueRosterSpec] = useState(null);
   const [currentWeek, setCurrentWeek] = useState(1);
   const [rankedPlayers, setRankedPlayers] = useState([]);
@@ -370,7 +383,7 @@ export default function DraftRoom({ league, profile, onBack }) {
   const [allWonPlayers, setAllWonPlayers] = useState([]);
   const [signingsLoaded, setSigningsLoaded] = useState(false);
   const [leagueTeams, setLeagueTeams] = useState([]);
-  const [viewingTeamName, setViewingTeamName] = useState(null);
+  const [viewingTeamId, setViewingTeamId] = useState(null);
   const [crestData, setCrestData] = useState({ pattern: 'vertical', color1: '#888888', color2: '#ffffff' });
   const [teamName, setTeamName] = useState('My Team');
   const [error, setError] = useState('');
@@ -447,42 +460,54 @@ export default function DraftRoom({ league, profile, onBack }) {
       });
   }, [league]);
 
-  // Every team in this league, paired with its owner's crest. Both tables are
-  // publicly readable, so this is the one fetch that lets the board show whose
-  // shield is actually on a nomination, a bid, or a won player — previously
-  // every team but your own fell back to an anonymous grey shield.
-  useEffect(() => {
+  // Every team in this league, with its current name and its owner's crest.
+  // Both tables are publicly readable, so this one fetch is what lets the board
+  // show whose shield is on a nomination, a bid or a won player — and it is
+  // also the live source for team *names*, which the draft session only ever
+  // stored as a snapshot taken at the moment of the bid.
+  async function loadLeagueTeams() {
     if (!league) return;
-    let cancelled = false;
-    supabase
+    const { data: teamRows, error: teamsErr } = await supabase
       .from('teams')
       .select('id, team_name, owner_id')
-      .eq('league_id', league.league_id)
-      .then(({ data: teamRows, error: teamsErr }) => {
-        if (cancelled) return;
-        if (teamsErr) { console.error('team crest fetch failed:', teamsErr); return; }
-        const rows = teamRows || [];
-        const ownerIds = rows.map((t) => t.owner_id).filter(Boolean);
-        if (ownerIds.length === 0) { setLeagueTeams(rows.map((t) => ({ ...t, crest: null }))); return; }
-        supabase
-          .from('profiles')
-          .select('id, crest_pattern, crest_color1, crest_color2')
-          .in('id', ownerIds)
-          .then(({ data: profileRows, error: profErr }) => {
-            if (cancelled) return;
-            if (profErr) { console.error('crest profile fetch failed:', profErr); }
-            const crestByOwner = {};
-            (profileRows || []).forEach((p) => {
-              crestByOwner[p.id] = {
-                pattern: p.crest_pattern || 'vertical',
-                color1: p.crest_color1 || '#888888',
-                color2: p.crest_color2 || '#ffffff',
-              };
-            });
-            setLeagueTeams(rows.map((t) => ({ ...t, crest: crestByOwner[t.owner_id] || null })));
-          });
-      });
-    return () => { cancelled = true; };
+      .eq('league_id', league.league_id);
+    if (teamsErr) { console.error('league team fetch failed:', teamsErr); return; }
+    const rows = teamRows || [];
+
+    const myRow = rows.find((t) => Number(t.id) === Number(league.team_id));
+    if (myRow && myRow.team_name) setTeamName(myRow.team_name);
+
+    const ownerIds = rows.map((t) => t.owner_id).filter(Boolean);
+    if (ownerIds.length === 0) { setLeagueTeams(rows.map((t) => ({ ...t, crest: null }))); return; }
+
+    const { data: profileRows, error: profErr } = await supabase
+      .from('profiles')
+      .select('id, crest_pattern, crest_color1, crest_color2')
+      .in('id', ownerIds);
+    if (profErr) console.error('crest profile fetch failed:', profErr);
+    const crestByOwner = {};
+    (profileRows || []).forEach((p) => {
+      crestByOwner[p.id] = {
+        pattern: p.crest_pattern || 'vertical',
+        color1: p.crest_color1 || '#888888',
+        color2: p.crest_color2 || '#ffffff',
+      };
+    });
+    setLeagueTeams(rows.map((t) => ({ ...t, crest: crestByOwner[t.owner_id] || null })));
+  }
+
+  // `teams` is in the realtime publication, so a rename anywhere reaches every
+  // browser in the room without a refresh.
+  useEffect(() => {
+    if (!league) return;
+    loadLeagueTeams();
+    const channel = supabase.channel(`league_teams_${league.league_id}`)
+      .on('postgres_changes', {
+        event: '*', schema: 'public', table: 'teams', filter: `league_id=eq.${league.league_id}`,
+      }, () => { loadLeagueTeams(); })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [league]);
 
   // Ticking clock drives countdown displays and all phase resolution
@@ -541,6 +566,26 @@ useEffect(() => {
     if (fetchError) { setError(fetchError.message); return; }
     const withTeams = data || [];
     setRankedPlayers(withTeams);
+
+    // The whole season's fixtures in one go — `games` is publicly readable, so
+    // this needs no RPC. Keyed by team then week, it turns into the "vs KC" /
+    // "@ KC" line under each week's price without a lookup per player.
+    supabase
+      .from('games')
+      .select('week, home_team, away_team')
+      .eq('season', 2026)
+      .eq('season_type', 'REG')
+      .then(({ data: gameRows, error: gamesErr }) => {
+        if (gamesErr) { console.error('Schedule fetch failed:', gamesErr); return; }
+        const byTeam = {};
+        (gameRows || []).forEach((g) => {
+          if (!byTeam[g.home_team]) byTeam[g.home_team] = {};
+          if (!byTeam[g.away_team]) byTeam[g.away_team] = {};
+          byTeam[g.home_team][g.week] = { opponent: g.away_team, isHome: true };
+          byTeam[g.away_team][g.week] = { opponent: g.home_team, isHome: false };
+        });
+        setScheduleByTeam(byTeam);
+      });
 
     supabase.rpc('get_team_bye_weeks', { p_season: 2026 }).then(({ data: byeRows, error: byeErr }) => {
       if (byeErr) { console.error('Bye week fetch failed:', byeErr); return; }
@@ -616,6 +661,16 @@ useEffect(() => {
       (fallbackTeamName && leagueTeams.find((t) => t.team_name === fallbackTeamName));
     if (match && match.crest) return match.crest;
     return { pattern: 'solid', color1: '#888888', color2: '#888888' };
+  }
+
+  // The session stores whatever a team was called when it bid, so a rename
+  // mid-draft would otherwise leave stale names on the board. Prefer the live
+  // name from `teams`, and fall back to the snapshot only for a team we
+  // haven't loaded.
+  function teamNameFor(teamId, fallbackTeamName) {
+    if (teamId === null || teamId === undefined) return fallbackTeamName || '';
+    const match = leagueTeams.find((t) => Number(t.id) === Number(teamId));
+    return (match && match.team_name) || fallbackTeamName || '';
   }
 
   function statsRowFor(player, view) {
@@ -725,7 +780,7 @@ useEffect(() => {
     setMyWeeksInputs((prev) => ({ ...prev, [key]: String(weeksEntered) }));
   }
 
-  function buildMyRosterSlots() {
+  function buildRosterSlotsForTeam(teamId) {
     if (!leagueRosterSpec) return [];
     const positionCounts = [
       ['QB', leagueRosterSpec.roster_qb], ['RB', leagueRosterSpec.roster_rb],
@@ -733,37 +788,7 @@ useEffect(() => {
       ['FL', leagueRosterSpec.roster_flex], ['SF', leagueRosterSpec.roster_superflex],
       ['BE', leagueRosterSpec.roster_bench],
     ];
-    const byPosition = { QB: [], RB: [], WR: [], TE: [] };
-    wonPlayers.forEach((w) => { if (byPosition[w.player.player_position]) byPosition[w.player.player_position].push(w); });
-    const used = new Set();
-    const rosterSlots = [];
-    for (const [pos, count] of positionCounts) {
-      for (let i = 0; i < (count || 0); i++) {
-        let won = null;
-        if (['QB', 'RB', 'WR', 'TE'].includes(pos)) {
-          won = byPosition[pos].find((w) => !used.has(w.player.sleeper_id)) || null;
-        } else if (pos === 'FL') {
-          won = ['RB', 'WR', 'TE'].flatMap((p) => byPosition[p]).find((w) => !used.has(w.player.sleeper_id)) || null;
-        } else {
-          // SF and BE accept any position, including QB
-          won = wonPlayers.find((w) => !used.has(w.player.sleeper_id)) || null;
-        }
-        if (won) used.add(won.player.sleeper_id);
-        rosterSlots.push({ position: pos, won });
-      }
-    }
-    return rosterSlots;
-  }
-
-  function buildRosterSlotsForTeam(teamName) {
-    if (!leagueRosterSpec) return [];
-    const positionCounts = [
-      ['QB', leagueRosterSpec.roster_qb], ['RB', leagueRosterSpec.roster_rb],
-      ['WR', leagueRosterSpec.roster_wr], ['TE', leagueRosterSpec.roster_te],
-      ['FL', leagueRosterSpec.roster_flex], ['SF', leagueRosterSpec.roster_superflex],
-      ['BE', leagueRosterSpec.roster_bench],
-    ];
-    const teamPicks = allWonPlayers.filter((w) => w.teamName === teamName);
+    const teamPicks = allWonPlayers.filter((w) => Number(w.teamId) === Number(teamId));
     const byPosition = { QB: [], RB: [], WR: [], TE: [] };
     teamPicks.forEach((w) => { if (byPosition[w.player.player_position]) byPosition[w.player.player_position].push(w); });
     const used = new Set();
@@ -786,9 +811,9 @@ useEffect(() => {
     return rosterSlots;
   }
 
-  function totalSpentByTeam(teamName) {
+  function totalSpentByTeam(teamId) {
     return allWonPlayers
-      .filter((w) => w.teamName === teamName)
+      .filter((w) => Number(w.teamId) === Number(teamId))
       .reduce((sum, w) => sum + costAtWeekWithBye(w.baseValue, w.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[w.player.team]), 0);
   }
 
@@ -1148,8 +1173,10 @@ useEffect(() => {
             style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}
             onClick={() => setShowTeamDropdown((v) => !v)}
           >
-            <Crest {...crestFor(null, viewingTeamName || teamName)} size={36} />
-            <span style={{ fontWeight: 'bold' }}>{viewingTeamName || teamName} ▾</span>
+            <Crest {...crestFor(viewingTeamId ?? league?.team_id, teamName)} size={36} />
+            <span style={{ fontWeight: 'bold' }}>
+              {teamNameFor(viewingTeamId ?? league?.team_id, teamName)} ▾
+            </span>
           </div>
           <div style={{ display: 'flex', gap: 6 }}>
             <button
@@ -1182,7 +1209,7 @@ useEffect(() => {
                     display: 'block', width: '100%', textAlign: 'left', marginBottom: 8,
                     background: 'var(--color-success)', color: '#111', fontWeight: 'bold',
                   }}
-                  onClick={() => { setViewingTeamName(null); setShowTeamDropdown(false); }}
+                  onClick={() => { setViewingTeamId(null); setShowTeamDropdown(false); }}
                 >
                   {teamName} (You)
                 </button>
@@ -1191,17 +1218,17 @@ useEffect(() => {
                     <div className="muted-text" style={{ fontSize: '0.75rem', color: t.tier_color || 'var(--color-text-muted)' }}>
                       {t.tier_name || `Tier ${t.tier_number}`}
                     </div>
-                    {(t.teams || []).filter((team) => team.team_name !== teamName).map((team) => (
+                    {(t.teams || []).filter((team) => Number(team.team_id) !== Number(league?.team_id)).map((team) => (
                       <button
                         key={team.team_id}
                         style={{
                           display: 'flex', alignItems: 'center', gap: 6, width: '100%', textAlign: 'left',
                           background: t.tier_color || 'var(--color-button-bg)', marginTop: 2,
                         }}
-                        onClick={() => { setViewingTeamName(team.team_name === teamName ? null : team.team_name); setShowTeamDropdown(false); }}
+                        onClick={() => { setViewingTeamId(team.team_id); setShowTeamDropdown(false); }}
                       >
                         <Crest {...crestFor(team.team_id, team.team_name)} size={18} />
-                        {team.team_name}
+                        {teamNameFor(team.team_id, team.team_name)}
                       </button>
                     ))}
                   </div>
@@ -1213,7 +1240,7 @@ useEffect(() => {
 
         <div className="muted-text" style={{ fontSize: '0.75rem', marginTop: 6 }}>
           Cap Remaining: <span style={{ color: 'var(--color-success)', fontWeight: 'bold' }}>
-            ${Math.max(0, salaryCap - totalSpentByTeam(viewingTeamName || teamName)).toFixed(2)}
+            ${Math.max(0, salaryCap - totalSpentByTeam(viewingTeamId ?? league?.team_id)).toFixed(2)}
           </span>
         </div>
 
@@ -1223,7 +1250,7 @@ useEffect(() => {
             <span className="muted-text" style={{ fontSize: '0.7rem' }}>Player</span>
             <span className="muted-text" style={{ fontSize: '0.7rem' }}>Cost</span>
           </div>
-          {(viewingTeamName && viewingTeamName !== teamName ? buildRosterSlotsForTeam(viewingTeamName) : buildMyRosterSlots()).map((slot, i) => {
+          {buildRosterSlotsForTeam(viewingTeamId ?? league?.team_id).map((slot, i) => {
             const cost = slot.won ? costAtWeekWithBye(slot.won.baseValue, slot.won.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[slot.won.player.team]) : null;
             return (
               <div key={i} style={{ display: 'grid', gridTemplateColumns: '45px 1fr 55px', gap: 4, alignItems: 'center', padding: '4px 0', borderBottom: '1px solid var(--color-border-subtle)' }}>
@@ -1261,7 +1288,7 @@ useEffect(() => {
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 16 }}>
                     <Crest {...crestFor(teamTurnOrder[0].teamId, teamTurnOrder[0].name)} size={28} />
                     <span style={{ color: 'var(--color-error)', fontWeight: 'bold' }}>
-                      {teamTurnOrder[0].name} will be up first
+                      {teamNameFor(teamTurnOrder[0].teamId, teamTurnOrder[0].name)} will be up first
                     </span>
                   </div>
                 )}
@@ -1335,19 +1362,25 @@ useEffect(() => {
       {s.player.player_position} – {s.player.team}
     </div>
     <div className="muted-text" style={{ fontSize: '0.8rem', marginTop: 4 }}>
-      <div>Wk {currentWeek}: —</div>
-      <div>Wk {currentWeek + 1}: —</div>
-      <div>Wk {currentWeek + 2}: —</div>
+      {[0, 1, 2].map((offset) => {
+        const wk = currentWeek + offset;
+        const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+        return (
+          <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+            Wk {wk}: —{matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
+          </div>
+        );
+      })}
     </div>
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
       <Crest {...crestFor(s.teamId, s.teamName)} size={22} />
-      <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.teamName}</span>
+      <span className="muted-text" style={{ fontSize: '0.8rem' }}>{teamNameFor(s.teamId, s.teamName)}</span>
     </div>
   </>
 ) : (
                   <>
                     <Crest {...crestFor(s.teamId, s.teamName)} size={50} />
-                    <div style={{ fontWeight: 'bold', marginTop: 8 }}>{s.teamName}</div>
+                    <div style={{ fontWeight: 'bold', marginTop: 8 }}>{teamNameFor(s.teamId, s.teamName)}</div>
                     <div className="muted-text" style={{ fontSize: '0.75rem' }}>{s.isMe ? 'Your pick' : 'choosing...'}</div>
                   </>
                 )}
@@ -1377,7 +1410,7 @@ useEffect(() => {
                 <div style={{ fontWeight: 'bold', marginTop: 8 }}>{w.player.full_name}</div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 10 }}>
                   <Crest {...crestFor(w.teamId, w.teamName)} size={32} />
-                  <span className="muted-text" style={{ fontSize: '0.85rem' }}>{w.teamName}</span>
+                  <span className="muted-text" style={{ fontSize: '0.85rem' }}>{teamNameFor(w.teamId, w.teamName)}</span>
                 </div>
                 <div style={{ color: 'var(--color-success)', fontWeight: 'bold', marginTop: 8 }}>${w.amount}</div>
               </div>
@@ -1406,7 +1439,7 @@ useEffect(() => {
                     }}
                   >
                     <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={sizing.imgSize * 0.4} />
-                    <div style={{ fontWeight: 'bold', marginTop: 6 }}>{s.highBidderTeamName}</div>
+                    <div style={{ fontWeight: 'bold', marginTop: 6 }}>{teamNameFor(s.highBidderTeamId, s.highBidderTeamName)}</div>
                     <div className="muted-text" style={{ fontSize: sizing.statSize }}>{s.player.full_name}</div>
                     <div style={{ color: 'var(--color-success)', fontWeight: 'bold', marginTop: 4 }}>${s.highBid}</div>
                   </div>
@@ -1441,7 +1474,7 @@ useEffect(() => {
                           <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={40} />
                           <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
                           {s.highBidderTeamName && (
-                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{s.highBidderTeamName}</span>
+                            <span className="muted-text" style={{ fontSize: '0.8rem' }}>{teamNameFor(s.highBidderTeamId, s.highBidderTeamName)}</span>
                           )}
                         </div>
 
@@ -1611,16 +1644,22 @@ useEffect(() => {
                     })()
                   ) : (
                     <div className="muted-text" style={{ fontSize: sizing.statSize, marginTop: 4 }}>
-                      <div>Wk {currentWeek}: ${projectedValue.toFixed(2)}</div>
-                      <div>Wk {currentWeek + 1}: ${(projectedValue * 1.0123).toFixed(2)}</div>
-                      <div>Wk {currentWeek + 2}: ${(projectedValue * Math.pow(1.0123, 2)).toFixed(2)}</div>
-                      <div>Wk {currentWeek + 3}: ${(projectedValue * Math.pow(1.0123, 3)).toFixed(2)}</div>
+                      {[0, 1, 2, 3].map((offset) => {
+                        const wk = currentWeek + offset;
+                        const matchup = formatMatchup(scheduleByTeam, s.player.team, wk);
+                        return (
+                          <div key={wk} style={{ whiteSpace: 'nowrap' }}>
+                            Wk {wk}: ${(projectedValue * Math.pow(1.0123, offset)).toFixed(2)}
+                            {matchup && <span style={{ marginLeft: 4 }}>{matchup}</span>}
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
 
                   <div
                     style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 8 }}
-                    title={s.highBidderTeamName ? `Leading bid: ${s.highBidderTeamName}` : 'No bids yet'}
+                    title={s.highBidderTeamName ? `Leading bid: ${teamNameFor(s.highBidderTeamId, s.highBidderTeamName)}` : 'No bids yet'}
                   >
                     <Crest {...crestFor(s.highBidderTeamId, s.highBidderTeamName)} size={34} />
                     <span style={{ fontWeight: 'bold', color: bidAmountColor(s.highBid, salaryCap) }}>${s.highBid}</span>
