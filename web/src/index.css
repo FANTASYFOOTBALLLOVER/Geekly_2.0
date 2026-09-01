@@ -816,3 +816,38 @@ select {
     border-top: 2px solid var(--color-success);
   }
 }
+/* --- Hold-to-fullscreen panels ------------------------------------------
+   Press and hold for 2.5s anywhere in a panel to expand it over the whole
+   window; hold again or press Escape to shrink it back. Replaces the old
+   fullscreen button entirely — there is no chrome for this. */
+.panel-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  top: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  width: auto !important;
+  height: auto !important;
+  max-width: none !important;
+  max-height: none !important;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  z-index: 400;
+  overflow-y: auto;
+  background: var(--color-bg-panel);
+}
+
+.fullscreen-hint {
+  position: fixed;
+  top: 10px;
+  right: 14px;
+  z-index: 401;
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+  background: var(--color-bg-input);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 999px;
+  padding: 3px 10px;
+  pointer-events: none;
+}

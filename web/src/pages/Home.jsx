@@ -1,11 +1,38 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../supabaseClient';
+import { canFitPosition, countByPosition } from '../draftControls';
+import { useHoldToFullscreen } from '../holdToFullscreen';
 import geeklyLogo from '../assets/final-logo-geekly.png';
 const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
 
 // Team names sit in narrow columns all over the app — the roster panel, the
 // draft board, the standings table — so they need a ceiling.
 const MAX_TEAM_NAME_LENGTH = 20;
+
+// Where the last league you were looking at is remembered between reloads.
+const LAST_LEAGUE_KEY = 'geekly:lastLeagueId';
+
+// The General tab's fields, in one place, so the form loads and verifies
+// exactly the same set of columns.
+const GENERAL_SETTINGS_COLUMNS =
+  'name, is_public, bonus_win_top_half, num_teams, relegation_tiers, season_weeks, promote_relegate_count, salary_cap, ir_voids_contract, relegation_enabled';
+const GENERAL_SETTINGS_FIELDS = [
+  'name', 'is_public', 'bonus_win_top_half', 'num_teams', 'relegation_tiers',
+  'season_weeks', 'promote_relegate_count', 'salary_cap', 'ir_voids_contract',
+];
+
+// Reports which of the values we just submitted did not actually land in the
+// database, so a save that quietly failed says so instead of claiming "Saved."
+function fieldsThatDidNotStick(submitted, saved, fields) {
+  return fields.filter((f) => {
+    const want = submitted[f];
+    const got = saved[f];
+    if (typeof got === 'boolean' || typeof want === 'boolean') return Boolean(want) !== Boolean(got);
+    if (want === null || want === undefined || want === '') return false;
+    if (!Number.isNaN(Number(want)) && !Number.isNaN(Number(got))) return Number(want) !== Number(got);
+    return String(want) !== String(got);
+  });
+}
 
 function Crest({ pattern, color1, color2, size = 40, onClick, title, empty = false }) {
   const clipId = `shield-clip-${pattern}-${(color1 || '').replace('#', '')}-${(color2 || '').replace('#', '')}`;
@@ -79,8 +106,12 @@ const NFL_TEAM_COLORS = {
 
 const POSITION_SLOT_COLORS = {
   QB: 'var(--color-pos-qb)', RB: 'var(--color-pos-rb)', WR: 'var(--color-pos-wr)',
-  TE: 'var(--color-pos-te)', FLEX: '#8ab4ff', SFLEX: '#b48ee0',
+  TE: 'var(--color-pos-te)', FLEX: '#8ab4ff', SFLEX: '#b48ee0', BENCH: '#6b6b7a',
 };
+
+// Bench rows sit under the starters, so their badge is abbreviated and the
+// player's name is dimmed rather than shown at full strength.
+const SLOT_BADGE_LABEL = { BENCH: 'BE', SFLEX: 'SF', FLEX: 'FL' };
 
 function easternWallClockToUTCISOStringHelper(dateTimeLocalStr) {
   const [datePart, timePart] = dateTimeLocalStr.split('T');
@@ -209,6 +240,432 @@ function generateRoundRobinSchedule(numTeams, numWeeks) {
   return schedule;
 }
 
+// --- Free agency --------------------------------------------------------
+// Anybody unrostered anywhere in the league can be signed for a single week
+// at no cost — but only by cutting somebody, and a cut contract keeps
+// charging 80% of what it would have cost in every week it still had left.
+
+const FA_SEASON = 2026;
+const DEAD_CAP_RATE = 0.80;
+const FA_PAGE_SIZE = 60;
+
+// What a contract costs its team in a given week, before any dead-cap haircut.
+function contractCostInWeek(contract, week) {
+  const weeksElapsed = week - contract.start_week;
+  return Number(contract.base_value) * (1 + weeksElapsed * Number(contract.interest_rate_applied || 0));
+}
+
+// Cutting in `week` leaves 80% of every remaining week on the books, right
+// through to the contract's original end week.
+function deadCapSchedule(contract, week) {
+  const rows = [];
+  for (let w = week; w <= Number(contract.end_week); w++) {
+    rows.push({ week: w, cost: contractCostInWeek(contract, w) * DEAD_CAP_RATE });
+  }
+  return rows;
+}
+
+function FreeAgentBoard({ league, week, rosterSpec, onSigned }) {
+  const [freeAgents, setFreeAgents] = useState([]);
+  const [contracts, setContracts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [faError, setFaError] = useState('');
+  const [positionFilter, setPositionFilter] = useState('ALL');
+  const [search, setSearch] = useState('');
+  const [visible, setVisible] = useState(FA_PAGE_SIZE);
+  const [target, setTarget] = useState(null);   // the free agent being signed
+  const [cutId, setCutId] = useState(null);     // which contract pays for him
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    if (!league) return;
+    setLoading(true);
+    const [{ data: fa, error: faErr }, { data: mine, error: mineErr }] = await Promise.all([
+      supabase.rpc('get_free_agents', { p_league_id: league.league_id, p_season: FA_SEASON }),
+      supabase.rpc('get_team_contracts', { p_team_id: league.team_id, p_season: FA_SEASON }),
+    ]);
+    setLoading(false);
+    if (faErr || mineErr) { setFaError((faErr || mineErr).message); return; }
+    setFaError('');
+    setFreeAgents(fa || []);
+    setContracts(mine || []);
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [league?.league_id]);
+
+  const positions = ['QB', 'RB', 'WR', 'TE'];
+  const filtered = freeAgents.filter((p) => {
+    const matchesPos = positionFilter === 'ALL' || p.player_position === positionFilter;
+    const matchesSearch = !search || p.full_name.toLowerCase().includes(search.toLowerCase());
+    return matchesPos && matchesSearch;
+  });
+
+  // Cutting this contract frees its slot, so capacity is judged on the roster
+  // minus that player — exactly what the server re-checks before it commits.
+  function cutMakesRoom(contract) {
+    if (!target) return false;
+    const remaining = contracts.filter((c) => c.signing_id !== contract.signing_id);
+    return canFitPosition(rosterSpec, countByPosition(remaining), target.player_position);
+  }
+
+  async function handleSign() {
+    if (!target || !cutId) return;
+    setBusy(true);
+    const { error } = await supabase.rpc('sign_free_agent', {
+      p_team_id: league.team_id,
+      p_sleeper_id: target.sleeper_id,
+      p_cut_signing_id: cutId,
+      p_week: week,
+      p_season: FA_SEASON,
+    });
+    setBusy(false);
+    if (error) { setFaError(error.message); return; }
+    setFaError('');
+    setTarget(null);
+    setCutId(null);
+    await load();
+    if (onSigned) onSigned();
+  }
+
+  const chosenCut = contracts.find((c) => c.signing_id === cutId) || null;
+  const deadRows = chosenCut ? deadCapSchedule(chosenCut, week) : [];
+  const deadTotal = deadRows.reduce((sum, r) => sum + r.cost, 0);
+
+  return (
+    <div style={{ marginTop: 24, borderTop: '1px solid var(--color-border-subtle)', paddingTop: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+        <strong style={{ marginRight: 4 }}>Add Players</strong>
+        <input
+          type="text"
+          placeholder="Search free agents..."
+          value={search}
+          onChange={(e) => { setSearch(e.target.value); setVisible(FA_PAGE_SIZE); }}
+          style={{ flex: '0 1 260px', borderRadius: 10 }}
+        />
+        <button
+          onClick={() => { setPositionFilter('ALL'); setVisible(FA_PAGE_SIZE); }}
+          title="All positions"
+          style={{
+            width: 32, height: 32, borderRadius: '50%', padding: 0, background: '#000',
+            border: positionFilter === 'ALL' ? '2px solid #ff1493' : '2px solid #fff',
+            color: '#fff', fontSize: '0.6rem', fontWeight: 'bold',
+          }}
+        >
+          ALL
+        </button>
+        {positions.map((pos) => (
+          <button
+            key={pos}
+            onClick={() => { setPositionFilter(pos); setVisible(FA_PAGE_SIZE); }}
+            title={pos}
+            style={{
+              width: 32, height: 32, borderRadius: '50%', padding: 0,
+              background: POSITION_SLOT_COLORS[pos],
+              border: positionFilter === pos ? '2px solid #ff1493' : '2px solid transparent',
+              color: '#111', fontSize: '0.65rem', fontWeight: 'bold',
+            }}
+          >
+            {pos}
+          </button>
+        ))}
+        <span className="muted-text" style={{ fontSize: '0.72rem', marginLeft: 'auto' }}>
+          One week, free — but you have to cut somebody and eat {Math.round(DEAD_CAP_RATE * 100)}% of their remaining weeks.
+        </span>
+      </div>
+
+      {faError && <div className="error-text" style={{ marginBottom: 8 }}>{faError}</div>}
+      {loading && <div className="muted-text">Loading free agents...</div>}
+      {!loading && filtered.length === 0 && (
+        <div className="muted-text">No free agents match that filter.</div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 8 }}>
+        {filtered.slice(0, visible).map((p) => (
+          <div
+            key={p.sleeper_id}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 10, padding: 8, minWidth: 0,
+              border: '1px solid var(--color-border-subtle)', borderRadius: 8,
+              background: 'var(--color-bg-input)',
+            }}
+          >
+            <img
+              src={`https://sleepercdn.com/content/nfl/players/${p.sleeper_id}.jpg`}
+              alt={p.full_name}
+              onError={(e) => { e.target.style.visibility = 'hidden'; }}
+              style={{ width: 40, height: 40, borderRadius: 6, objectFit: 'cover', background: 'var(--color-avatar-fallback)', flex: '0 0 auto' }}
+            />
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontWeight: 'bold', fontSize: '0.9rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {p.full_name}
+              </div>
+              <div style={{ fontSize: '0.72rem', fontWeight: 'bold', color: NFL_TEAM_COLORS[p.team] || 'var(--color-text-muted)' }}>
+                {p.player_position} – {p.team || 'FA'}
+              </div>
+            </div>
+            <span className="muted-text" style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
+              ${Number(p.dollar_value).toFixed(0)}
+            </span>
+            <button
+              onClick={() => { setTarget(p); setCutId(null); setFaError(''); }}
+              title={`Sign ${p.full_name} for week ${week}`}
+              style={{
+                width: 28, height: 28, borderRadius: '50%', padding: 0, flex: '0 0 auto',
+                background: 'var(--color-success)', color: '#111', border: 'none',
+                fontWeight: 'bold', fontSize: '1.1rem', lineHeight: 1,
+              }}
+            >
+              +
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {filtered.length > visible && (
+        <button
+          onClick={() => setVisible((v) => v + FA_PAGE_SIZE)}
+          style={{ marginTop: 10, background: 'none', border: 'none', color: 'var(--color-text-muted)', textDecoration: 'underline', padding: 0, cursor: 'pointer' }}
+        >
+          Show more ({filtered.length - visible} left)
+        </button>
+      )}
+
+      {target && (
+        <div
+          className="modal-overlay"
+          // Holding inside this dialog must not toggle the panel behind it
+          // in and out of full screen.
+          data-no-fullscreen
+          style={{ zIndex: 500 }}
+          onClick={() => setTarget(null)}
+        >
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0 }}>Sign {target.full_name} for week {week}</h3>
+            <p className="muted-text" style={{ marginTop: -6 }}>
+              A one-week deal at no cost. Pick the contract you're cutting to make room —
+              {' '}{Math.round(DEAD_CAP_RATE * 100)}% of every week it had left still counts against your cap.
+            </p>
+
+            <div style={{ maxHeight: 260, overflowY: 'auto', marginTop: 8 }}>
+              {contracts.length === 0 && <div className="muted-text">You have no contracts to cut.</div>}
+              {contracts.map((c) => {
+                const makesRoom = cutMakesRoom(c);
+                const total = deadCapSchedule(c, week).reduce((sum, r) => sum + r.cost, 0);
+                return (
+                  <label
+                    key={c.signing_id}
+                    style={{
+                      display: 'grid', gridTemplateColumns: '20px 1fr auto', gap: 8, alignItems: 'center',
+                      padding: '6px 4px', borderBottom: '1px solid var(--color-border-subtle)',
+                      opacity: makesRoom ? 1 : 0.45, cursor: makesRoom ? 'pointer' : 'not-allowed',
+                    }}
+                    title={makesRoom ? undefined : `Cutting ${c.full_name} still leaves nowhere to put a ${target.player_position}.`}
+                  >
+                    <input
+                      type="radio"
+                      name="cut-choice"
+                      disabled={!makesRoom}
+                      checked={cutId === c.signing_id}
+                      onChange={() => setCutId(c.signing_id)}
+                    />
+                    <span style={{ minWidth: 0 }}>
+                      <span style={{ fontWeight: 'bold' }}>{c.full_name}</span>{' '}
+                      <span className="muted-text" style={{ fontSize: '0.75rem' }}>
+                        {c.player_position} – {c.team} · wks {c.start_week}–{c.end_week}
+                      </span>
+                    </span>
+                    <span style={{ color: 'var(--color-error)', fontSize: '0.8rem', whiteSpace: 'nowrap' }}>
+                      dead ${total.toFixed(2)}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+
+            {chosenCut && (
+              <div style={{ marginTop: 12 }}>
+                <div className="scoring-subheading" style={{ marginTop: 0 }}>
+                  Dead cap from cutting {chosenCut.full_name}
+                </div>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', fontSize: '0.75rem' }}>
+                  {deadRows.map((r) => (
+                    <span key={r.week} className="muted-text">
+                      Wk {r.week}: <strong style={{ color: 'var(--color-error)' }}>${r.cost.toFixed(2)}</strong>
+                    </span>
+                  ))}
+                </div>
+                <div style={{ marginTop: 6, fontWeight: 'bold' }}>
+                  Total dead cap: <span style={{ color: 'var(--color-error)' }}>${deadTotal.toFixed(2)}</span>
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+              <button
+                disabled={!cutId || busy}
+                onClick={handleSign}
+                style={{ background: 'var(--color-success)', color: '#111', fontWeight: 'bold' }}
+              >
+                {busy ? 'Signing...' : `Cut & Sign`}
+              </button>
+              <button onClick={() => setTarget(null)}>Cancel</button>
+            </div>
+            {faError && <div className="error-text" style={{ marginTop: 8 }}>{faError}</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// --- Player stock -------------------------------------------------------
+// Who the whole site is buying and selling, not just your own league. The
+// number behind a card is deliberately plain: how many teams anywhere signed
+// this player to start the current week, against the week before.
+
+const STOCK_SEASON = 2026;
+const STOCK_ROTATE_MS = 6000;
+const STOCK_UP_COLOR = 'var(--color-success)';
+const STOCK_DOWN_COLOR = 'var(--color-error)';
+
+function StockSparkline({ series, color, height = 44 }) {
+  const points = (series || []).map((d) => Number(d.count) || 0);
+  if (points.length < 2) return <div style={{ height }} />;
+
+  const width = 100; // viewBox units; the svg itself stretches to its box
+  const max = Math.max(...points);
+  const min = Math.min(...points);
+  const span = max - min || 1;
+  const step = width / (points.length - 1);
+  const coords = points.map((v, i) => [i * step, height - ((v - min) / span) * (height - 6) - 3]);
+  const line = coords.map(([x, y], i) => `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`).join(' ');
+  const [lastX, lastY] = coords[coords.length - 1];
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      style={{ width: '100%', height, display: 'block' }}
+    >
+      <path d={`${line} L ${width} ${height} L 0 ${height} Z`} fill={color} opacity="0.16" />
+      <path d={line} fill="none" stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" />
+      <circle cx={lastX} cy={lastY} r="2.5" fill={color} />
+    </svg>
+  );
+}
+
+function StockCard({ mover }) {
+  const up = mover.direction === 'up';
+  const color = up ? STOCK_UP_COLOR : STOCK_DOWN_COLOR;
+  return (
+    <div
+      style={{
+        border: `1px solid ${color}`, borderRadius: 8, padding: 8,
+        background: 'var(--color-bg-input)', display: 'flex', flexDirection: 'column',
+        gap: 4, minWidth: 0, overflow: 'hidden',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+        <img
+          src={`https://sleepercdn.com/content/nfl/players/${mover.sleeper_id}.jpg`}
+          alt={mover.full_name}
+          onError={(e) => { e.target.style.visibility = 'hidden'; }}
+          style={{ width: 34, height: 34, borderRadius: 6, objectFit: 'cover', background: 'var(--color-avatar-fallback)', flex: '0 0 auto' }}
+        />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontWeight: 'bold', fontSize: '0.85rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {mover.full_name}
+          </div>
+          <div style={{ fontSize: '0.7rem', color: NFL_TEAM_COLORS[mover.team] || 'var(--color-text-muted)', fontWeight: 'bold' }}>
+            {mover.player_position} – {mover.team || 'FA'}
+          </div>
+        </div>
+        <div style={{ color, fontWeight: 'bold', fontSize: '0.85rem', whiteSpace: 'nowrap' }}>
+          {up ? '▲' : '▼'} {Math.abs(mover.delta)}
+        </div>
+      </div>
+      <StockSparkline series={mover.series} color={color} />
+      <div className="muted-text" style={{ fontSize: '0.65rem' }}>
+        Wk {mover.week}: signed in {mover.this_week} {mover.this_week === 1 ? 'league' : 'leagues'} (was {mover.last_week})
+      </div>
+    </div>
+  );
+}
+
+function PlayerStockBoard({ expanded }) {
+  const [movers, setMovers] = useState([]);
+  const [stockError, setStockError] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const [rotation, setRotation] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    // The snapshot table is recomputed for this season before it is read, so
+    // the cards never lag behind a draft that just finished somewhere.
+    supabase
+      .rpc('refresh_player_draft_stock', { p_season: STOCK_SEASON })
+      .then(() => supabase.rpc('get_player_stock_movers', {
+        p_season: STOCK_SEASON, p_limit: 4, p_history_weeks: 6,
+      }))
+      .then(({ data, error: moversErr }) => {
+        if (cancelled) return;
+        setLoaded(true);
+        if (moversErr) { setStockError(moversErr.message); return; }
+        setMovers(data || []);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  const risers = movers.filter((m) => m.direction === 'up');
+  const fallers = movers.filter((m) => m.direction === 'down');
+  const rotates = !expanded && Math.max(risers.length, fallers.length) > 2;
+
+  useEffect(() => {
+    if (!rotates) return undefined;
+    const interval = setInterval(() => setRotation((r) => r + 1), STOCK_ROTATE_MS);
+    return () => clearInterval(interval);
+  }, [rotates]);
+
+  function window2(list) {
+    if (list.length === 0) return [];
+    return Array.from({ length: Math.min(2, list.length) }, (_, i) => list[(rotation * 2 + i) % list.length]);
+  }
+
+  const shown = expanded ? [...risers, ...fallers] : [...window2(risers), ...window2(fallers)];
+
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 8 }}>
+        <strong>Player Stock</strong>
+        <span className="muted-text" style={{ fontSize: '0.7rem' }}>
+          Signings across every league, this week vs last
+        </span>
+      </div>
+
+      {stockError && <div className="error-text" style={{ fontSize: '0.75rem' }}>{stockError}</div>}
+
+      {!stockError && loaded && shown.length === 0 && (
+        <div className="muted-text" style={{ fontSize: '0.8rem' }}>
+          No movement yet — stock starts moving once leagues begin signing players.
+        </div>
+      )}
+
+      {shown.length > 0 && (
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: expanded ? 'repeat(auto-fill, minmax(230px, 1fr))' : 'repeat(2, minmax(0, 1fr))',
+          gap: 8,
+        }}>
+          {shown.map((m) => <StockCard key={`${m.direction}-${m.sleeper_id}`} mover={m} />)}
+        </div>
+      )}
+    </>
+  );
+}
+
 function ScoringRow({ label, abbr, value, touched, disabled, comingSoon, onChange, step = '0.01' }) {
   return (
     <div className="settings-row">
@@ -273,6 +730,7 @@ export default function Home({ profile, onLogout, onNavigate }) {
   };
   const [generalSettings, setGeneralSettings] = useState(null);
   const [generalMsg, setGeneralMsg] = useState('');
+  const [leagueExitConfirm, setLeagueExitConfirm] = useState(null); // null | 'leave' | 'delete'
   const [originalNumTeams, setOriginalNumTeams] = useState(null);
   const [scoringSettings, setScoringSettings] = useState(null);
   const [scoringTouched, setScoringTouched] = useState({});
@@ -299,8 +757,12 @@ export default function Home({ profile, onLogout, onNavigate }) {
   const [relegationMsg, setRelegationMsg] = useState('');
   const [relegationTouched, setRelegationTouched] = useState({});
   const [confirmingShuffleAll, setConfirmingShuffleAll] = useState(false);
+  const [confirmingRelegationRun, setConfirmingRelegationRun] = useState(false);
+  const [relegationMoves, setRelegationMoves] = useState(null);
   const [myTierStandings, setMyTierStandings] = useState(null);
   const [teamSignings, setTeamSignings] = useState([]);
+  const [deadCapContracts, setDeadCapContracts] = useState([]);
+  const [rosterVersion, setRosterVersion] = useState(0);
   const [opponentTeam, setOpponentTeam] = useState(null);
   const [opponentSignings, setOpponentSignings] = useState([]);
   const [leagueRosterSpec, setLeagueRosterSpec] = useState(null);
@@ -314,6 +776,13 @@ export default function Home({ profile, onLogout, onNavigate }) {
   const [crestMsg, setCrestMsg] = useState('');
   const [showAuctionDropdown, setShowAuctionDropdown] = useState(false);
   const [tier1Cap, setTier1Cap] = useState(null);
+  const [draftPhase, setDraftPhase] = useState(null);
+  const [week1EndsAt, setWeek1EndsAt] = useState(null);
+
+  // Press and hold for 2.5s inside a panel to blow it up full screen.
+  const teamPanel = useHoldToFullscreen();
+  const stockPanel = useHoldToFullscreen();
+  const q3Panel = useHoldToFullscreen();
 
   useEffect(() => {
     if (profile) {
@@ -335,10 +804,11 @@ export default function Home({ profile, onLogout, onNavigate }) {
     if (settingsSection !== 'General' || !activeLeague) return;
     supabase
       .from('leagues')
-      .select('name, is_public, bonus_win_top_half, num_teams, relegation_tiers, season_weeks, promote_relegate_count, salary_cap, ir_voids_contract')
+      .select(GENERAL_SETTINGS_COLUMNS)
       .eq('id', activeLeague.league_id)
       .single()
-      .then(({ data }) => {
+      .then(({ data, error: loadErr }) => {
+        if (loadErr) { setGeneralMsg(loadErr.message); return; }
         setGeneralSettings(data);
         setOriginalNumTeams(data ? data.num_teams : null);
       });
@@ -497,10 +967,42 @@ useEffect(() => {
     supabase.rpc('get_my_leagues').then(({ data }) => {
       if (data && data.length > 0) {
         setMyLeagues(data);
-        setActiveLeague(data[0]);
+        // Come back to whichever league you were last looking at rather than
+        // the first one you ever joined — reloading mid-draft should not drop
+        // you into a dormant league.
+        const remembered = Number(localStorage.getItem(LAST_LEAGUE_KEY));
+        setActiveLeague(data.find((l) => Number(l.league_id) === remembered) || data[0]);
       }
     });
   }, []);
+
+  useEffect(() => {
+    if (activeLeague) localStorage.setItem(LAST_LEAGUE_KEY, String(activeLeague.league_id));
+  }, [activeLeague]);
+
+  // The draft's live phase, kept current over realtime so the Enter Draft Room
+  // button stays up for everyone for as long as the auction is actually running
+  // — not just during the hour before its scheduled start.
+  useEffect(() => {
+    if (!activeLeague) { setDraftPhase(null); return; }
+    let cancelled = false;
+    supabase
+      .from('draft_sessions')
+      .select('phase')
+      .eq('league_id', activeLeague.league_id)
+      .maybeSingle()
+      .then(({ data }) => { if (!cancelled) setDraftPhase(data ? data.phase : null); });
+
+    const channel = supabase
+      .channel(`home_draft_session_${activeLeague.league_id}`)
+      .on('postgres_changes', {
+        event: '*', schema: 'public', table: 'draft_sessions',
+        filter: `league_id=eq.${activeLeague.league_id}`,
+      }, (payload) => setDraftPhase(payload.new ? payload.new.phase : null))
+      .subscribe();
+
+    return () => { cancelled = true; supabase.removeChannel(channel); };
+  }, [activeLeague]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -586,7 +1088,7 @@ useEffect(() => {
     if (!activeLeague) { setTeamSignings([]); setLeagueRosterSpec(null); return; }
     supabase
       .from('leagues')
-      .select('initial_draft_at, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, salary_cap')
+      .select('initial_draft_at, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, salary_cap, promote_relegate_count, relegation_enabled, relegation_tiers, max_draft_qb, max_draft_rb, max_draft_wr, max_draft_te')
       .eq('id', activeLeague.league_id)
       .single()
       .then(({ data }) => {
@@ -597,12 +1099,51 @@ useEffect(() => {
     supabase
       .rpc('get_team_active_signings', { p_team_id: activeLeague.team_id, p_season: 2026 })
       .then(({ data }) => setTeamSignings(data || []));
-  }, [activeLeague]);
+
+    // Contracts this team cut. They are off the roster but still on the books.
+    supabase
+      .rpc('get_team_dead_cap', { p_team_id: activeLeague.team_id, p_season: 2026 })
+      .then(({ data, error: deadErr }) => {
+        if (deadErr) { console.error('get_team_dead_cap failed:', deadErr); return; }
+        setDeadCapContracts(data || []);
+      });
+  }, [activeLeague, rosterVersion]);
 
   useEffect(() => {
     const interval = setInterval(() => setNow(Date.now()), 60000);
     return () => clearInterval(interval);
   }, []);
+
+  // No weekly auction may fall before NFL week 1 has finished playing, so the
+  // countdown is floored at the league's Tue/Wed/Thu slot on the far side of
+  // week 1's last kickoff.
+  useEffect(() => {
+    supabase
+      .from('games')
+      .select('game_date')
+      .eq('season', 2026)
+      .eq('season_type', 'REG')
+      .eq('week', 1)
+      .order('game_date', { ascending: false })
+      .limit(1)
+      .then(({ data, error: gamesErr }) => {
+        if (gamesErr) { console.error('week 1 schedule fetch failed:', gamesErr); return; }
+        const lastGameDate = data && data[0] && data[0].game_date;
+        if (!lastGameDate) return;
+        setWeek1EndsAt(new Date(easternWallClockToUTCISOStringHelper(`${lastGameDate}T23:59`)));
+      });
+  }, []);
+
+  function nextRecurringAuction(fromMs) {
+    if (!weeklyAuctionDay || !weeklyAuctionTime) return null;
+    const candidate = getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, new Date(fromMs));
+    if (!candidate) return null;
+    const firstAllowed = week1EndsAt
+      ? getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, week1EndsAt)
+      : null;
+    if (firstAllowed && candidate.getTime() < firstAllowed.getTime()) return firstAllowed;
+    return candidate;
+  }
 
   async function openFullRankings() {
     const { data } = await supabase.rpc('get_top_rankings', { p_limit: 1000 });
@@ -642,8 +1183,8 @@ function minutesUntilAuction() {
   let target = null;
   if (firstDraftSchedule && new Date(firstDraftSchedule).getTime() > now) {
     target = new Date(firstDraftSchedule);
-  } else if (weeklyAuctionDay && weeklyAuctionTime) {
-    target = getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, new Date(now));
+  } else {
+    target = nextRecurringAuction(now);
   }
   if (!target) return null;
   return (target.getTime() - now) / 60000;
@@ -653,8 +1194,8 @@ function minutesUntilAuction() {
 
     if (firstDraftSchedule && new Date(firstDraftSchedule).getTime() > now) {
       target = new Date(firstDraftSchedule);
-    } else if (weeklyAuctionDay && weeklyAuctionTime) {
-      target = getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, new Date(now));
+    } else {
+      target = nextRecurringAuction(now);
     }
 
     if (target) {
@@ -703,20 +1244,40 @@ function minutesUntilAuction() {
   }
 
   function buildWeekCapSegments(week) {
+    // Each slice keeps the individual contracts behind it so hovering a week
+    // shows exactly which players that money is going to, the way the draft
+    // room already does — not just the position label.
     const byPosition = {};
     let totalSpent = 0;
     for (const s of teamSignings) {
       if (week >= s.start_week && week <= s.end_week) {
         const { cost } = contractCostAtWeek(s, week);
-        byPosition[s.player_position] = (byPosition[s.player_position] || 0) + cost;
+        if (!byPosition[s.player_position]) byPosition[s.player_position] = { value: 0, meta: [] };
+        byPosition[s.player_position].value += cost;
+        byPosition[s.player_position].meta.push({ name: s.full_name, cost });
         totalSpent += cost;
       }
     }
-    const segments = Object.entries(byPosition).map(([pos, val]) => ({
-      value: val,
+    const segments = Object.entries(byPosition).map(([pos, v]) => ({
+      value: v.value,
       color: POSITION_SLOT_COLORS[pos] || '#888',
-      meta: [{ name: pos, cost: val }],
+      meta: v.meta,
     }));
+    const deadMeta = [];
+    let deadTotal = 0;
+    for (const c of deadCapContracts) {
+      const from = Math.max(Number(c.cut_at_week) || 1, Number(c.start_week));
+      if (week < from || week > Number(c.end_week)) continue;
+      const cost = contractCostInWeek(c, week) * Number(c.dead_cap_pct ?? DEAD_CAP_RATE);
+      if (cost <= 0) continue;
+      deadMeta.push({ name: `${c.full_name} (dead)`, cost });
+      deadTotal += cost;
+    }
+    if (deadTotal > 0) {
+      segments.push({ value: deadTotal, color: 'var(--color-error)', meta: deadMeta });
+      totalSpent += deadTotal;
+    }
+
     const cap = leagueRosterSpec ? Number(leagueRosterSpec.salary_cap) : 300;
     const remaining = Math.max(0, cap - totalSpent);
     segments.push({ value: remaining, color: '#000', meta: [{ name: 'Cap Remaining', cost: remaining }] });
@@ -754,46 +1315,75 @@ function minutesUntilAuction() {
 
   async function handleSaveGeneralSettings() {
     setGeneralMsg('');
-    const { error } = await supabase.rpc('update_general_settings', {
-      p_league_id: activeLeague.league_id,
-      p_name: generalSettings.name,
-      p_is_public: generalSettings.is_public,
-      p_bonus_win_top_half: generalSettings.bonus_win_top_half,
-      p_num_teams: Number(generalSettings.num_teams),
-      p_relegation_tiers: Number(generalSettings.relegation_tiers),
-      p_season_weeks: Number(generalSettings.season_weeks),
-      p_promote_relegate_count: Number(generalSettings.promote_relegate_count),
-      p_salary_cap: Number(generalSettings.salary_cap),
-      p_ir_voids_contract: generalSettings.ir_voids_contract,
-    });
-    setGeneralMsg(error ? error.message : 'Saved.');
-    if (error) return;
+    const submitted = generalSettings;
+    const tierCount = Math.max(1, Number(submitted.relegation_tiers) || 1);
+    try {
+      const { error } = await supabase.rpc('update_general_settings', {
+        p_league_id: activeLeague.league_id,
+        p_name: submitted.name,
+        p_is_public: submitted.is_public,
+        p_bonus_win_top_half: submitted.bonus_win_top_half,
+        p_num_teams: Number(submitted.num_teams),
+        p_relegation_tiers: tierCount,
+        p_season_weeks: Number(submitted.season_weeks),
+        p_promote_relegate_count: Number(submitted.promote_relegate_count),
+        p_salary_cap: Number(submitted.salary_cap),
+        p_ir_voids_contract: submitted.ir_voids_contract,
+      });
+      if (error) { setGeneralMsg(error.message); return; }
 
-    if (Number(generalSettings.num_teams) !== Number(originalNumTeams)) {
-      const tierCountForResize = generalSettings.relegation_tiers > 1 ? Number(generalSettings.relegation_tiers) : 1;
-      for (let tier = 1; tier <= tierCountForResize; tier++) {
-        await supabase.rpc('resize_league_tier_teams', {
-          p_league_id: activeLeague.league_id,
-          p_tier_number: tier,
-          p_new_num_teams: Number(generalSettings.num_teams),
-        });
-        await supabase.rpc('clear_tier_schedule', {
-          p_league_id: activeLeague.league_id,
-          p_season: 2026,
-          p_tier_number: tier,
-        });
-        const schedule = generateRoundRobinSchedule(Number(generalSettings.num_teams), Number(generalSettings.season_weeks));
-        await supabase.rpc('insert_matchups_bulk', {
-          p_league_id: activeLeague.league_id,
-          p_season: 2026,
-          p_tier_number: tier,
-          p_matchups: schedule,
-        });
+      // update_general_settings writes the tier *count* but nothing was writing
+      // the relegation on/off switch, so raising the count on a league created
+      // with relegation off looked like the setting refused to save.
+      const { error: relErr } = await supabase.rpc('update_league_relegation_enabled', {
+        p_league_id: activeLeague.league_id,
+        p_enabled: tierCount > 1,
+      });
+      if (relErr) { setGeneralMsg(relErr.message); return; }
+
+      if (Number(submitted.num_teams) !== Number(originalNumTeams)) {
+        for (let tier = 1; tier <= tierCount; tier++) {
+          await supabase.rpc('resize_league_tier_teams', {
+            p_league_id: activeLeague.league_id,
+            p_tier_number: tier,
+            p_new_num_teams: Number(submitted.num_teams),
+          });
+          await supabase.rpc('clear_tier_schedule', {
+            p_league_id: activeLeague.league_id,
+            p_season: 2026,
+            p_tier_number: tier,
+          });
+          const schedule = generateRoundRobinSchedule(Number(submitted.num_teams), Number(submitted.season_weeks));
+          await supabase.rpc('insert_matchups_bulk', {
+            p_league_id: activeLeague.league_id,
+            p_season: 2026,
+            p_tier_number: tier,
+            p_matchups: schedule,
+          });
+        }
+        setOriginalNumTeams(Number(submitted.num_teams));
       }
-      setOriginalNumTeams(Number(generalSettings.num_teams));
-    }
 
-    refreshLeagues(activeLeague.league_id);
+      // Read the row back rather than trusting the write — a value that didn't
+      // stick gets named instead of hiding behind a green "Saved."
+      const { data: saved } = await supabase
+        .from('leagues')
+        .select(GENERAL_SETTINGS_COLUMNS)
+        .eq('id', activeLeague.league_id)
+        .single();
+      if (saved) {
+        setGeneralSettings(saved);
+        setOriginalNumTeams(saved.num_teams);
+        const stuck = fieldsThatDidNotStick(submitted, saved, GENERAL_SETTINGS_FIELDS);
+        setGeneralMsg(stuck.length === 0 ? 'Saved.' : `Saved, except: ${stuck.join(', ')} — the database rejected those values.`);
+      } else {
+        setGeneralMsg('Saved.');
+      }
+
+      refreshLeagues(activeLeague.league_id);
+    } catch (err) {
+      setGeneralMsg(err.message || String(err));
+    }
   }
 
   function updateScoringField(field, value) {
@@ -804,6 +1394,7 @@ function minutesUntilAuction() {
   async function handleSaveScoringSettings() {
     setScoringMsg('');
     const s = scoringSettings;
+    try {
     const { error } = await supabase.rpc('update_scoring_settings', {
       p_league_id: activeLeague.league_id,
       p_pass_yd: Number(s.pass_yd),
@@ -836,6 +1427,9 @@ function minutesUntilAuction() {
     });
     setScoringMsg(error ? error.message : 'Saved.');
     if (!error) refreshLeagues(activeLeague.league_id);
+    } catch (err) {
+      setScoringMsg(err.message || String(err));
+    }
   }
 
   function updateAuctionField(field, value) {
@@ -866,6 +1460,13 @@ function minutesUntilAuction() {
       return;
     }
 
+    // A league whose tier caps haven't been set up yet comes back without a
+    // `tiers` array; mapping over it threw and killed the whole save silently.
+    const tierCaps = Array.isArray(s.tiers)
+      ? s.tiers.map((t) => ({ tier_number: t.tier_number, salary_cap: Number(t.salary_cap) }))
+      : [];
+
+    try {
     const { error } = await supabase.rpc('update_auction_settings', {
       p_league_id: activeLeague.league_id,
       p_initial_draft_at: easternWallClockToUTCISOString(s.initial_draft_at),
@@ -880,10 +1481,13 @@ function minutesUntilAuction() {
       p_max_long_term_contracts: Number(s.max_long_term_contracts),
       p_cap_rollover_pct: Number(s.cap_rollover_pct),
       p_allow_cap_trading: s.allow_cap_trading,
-      p_tier_caps: s.tiers.map((t) => ({ tier_number: t.tier_number, salary_cap: Number(t.salary_cap) })),
+      p_tier_caps: tierCaps,
     });
     setAuctionMsg(error ? error.message : 'Saved.');
     if (!error) refreshLeagues(activeLeague.league_id);
+    } catch (err) {
+      setAuctionMsg(err.message || String(err));
+    }
   }
 
   function updateRosterField(field, value) {
@@ -896,6 +1500,7 @@ function minutesUntilAuction() {
     const s = rosterSettings;
     const toIntOrNull = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
 
+    try {
     const { error } = await supabase.rpc('update_roster_settings', {
       p_league_id: activeLeague.league_id,
       p_roster_qb: Number(s.roster_qb),
@@ -911,8 +1516,24 @@ function minutesUntilAuction() {
       p_max_draft_wr: toIntOrNull(s.max_draft_wr),
       p_max_draft_te: toIntOrNull(s.max_draft_te),
     });
-    setRosterMsg(error ? error.message : 'Saved.');
-    if (!error) refreshLeagues(activeLeague.league_id);
+    if (error) { setRosterMsg(error.message); return; }
+
+    const { data: saved } = await supabase
+      .from('leagues')
+      .select('roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, roster_bye_slots, max_draft_qb, max_draft_rb, max_draft_wr, max_draft_te')
+      .eq('id', activeLeague.league_id)
+      .single();
+    if (saved) {
+      setRosterSettings(saved);
+      const stuck = fieldsThatDidNotStick(s, saved, Object.keys(saved));
+      setRosterMsg(stuck.length === 0 ? 'Saved.' : `Saved, except: ${stuck.join(', ')} — the database rejected those values.`);
+    } else {
+      setRosterMsg('Saved.');
+    }
+    refreshLeagues(activeLeague.league_id);
+    } catch (err) {
+      setRosterMsg(err.message || String(err));
+    }
   }
 
   function updateMatchupScoreLocal(matchupId, field, value) {
@@ -933,11 +1554,24 @@ function minutesUntilAuction() {
 
   async function handleSaveTierNamesColors() {
     setRelegationMsg('');
-    const { error } = await supabase.rpc('update_tier_names_colors', {
-      p_league_id: activeLeague.league_id,
-      p_tiers: relegationTiers.map((t) => ({ tier_number: t.tier_number, tier_name: t.tier_name, tier_color: t.tier_color, salary_cap: t.salary_cap })),
-    });
-    setRelegationMsg(error ? error.message : 'Saved.');
+    try {
+      const { error } = await supabase.rpc('update_tier_names_colors', {
+        p_league_id: activeLeague.league_id,
+        p_tiers: (relegationTiers || []).map((t) => ({
+          tier_number: t.tier_number, tier_name: t.tier_name,
+          tier_color: t.tier_color, salary_cap: Number(t.salary_cap),
+        })),
+      });
+      if (error) { setRelegationMsg(error.message); return; }
+      // Tier caps are editable from both here and the Auction tab, so re-read
+      // rather than leaving one screen showing what the other just replaced.
+      const { data } = await supabase.rpc('get_relegation_settings', { p_league_id: activeLeague.league_id });
+      setRelegationTiers(data || []);
+      setRelegationTouched({});
+      setRelegationMsg('Saved.');
+    } catch (err) {
+      setRelegationMsg(err.message || String(err));
+    }
   }
 
   async function handleShuffleAllTeams() {
@@ -971,6 +1605,26 @@ function minutesUntilAuction() {
     const { data } = await supabase.rpc('get_relegation_settings', { p_league_id: activeLeague.league_id });
     setRelegationTiers(data || []);
     setRelegationMsg('Saved.');
+    refreshMyTierStandings();
+  }
+
+  // End of season: everyone in a promotion or relegation zone actually moves.
+  // The server ranks each tier with the same standings the table shows and
+  // shifts the league's promote/relegate count off each end.
+  async function handleRunRelegation() {
+    setRelegationMsg('');
+    setRelegationMoves(null);
+    const { data, error } = await supabase.rpc('apply_end_of_season_relegation', {
+      p_league_id: activeLeague.league_id,
+      p_season: 2026,
+    });
+    setConfirmingRelegationRun(false);
+    if (error) { setRelegationMsg(error.message); return; }
+
+    setRelegationMoves(data || []);
+    const { data: tiers } = await supabase.rpc('get_relegation_settings', { p_league_id: activeLeague.league_id });
+    setRelegationTiers(tiers || []);
+    setRelegationMsg((data || []).length === 0 ? 'No teams changed tier.' : 'Saved.');
     refreshMyTierStandings();
   }
 
@@ -1163,10 +1817,33 @@ function minutesUntilAuction() {
 
   async function refreshLeagues(preferId) {
     const { data } = await supabase.rpc('get_my_leagues');
-    if (data) {
-      setMyLeagues(data);
-      setActiveLeague(data.find((l) => l.league_id === preferId) || data[0]);
-    }
+    const list = data || [];
+    setMyLeagues(list);
+    // Leaving or deleting your last league has to land you back on the empty
+    // state rather than leaving a league that no longer exists on screen.
+    setActiveLeague(list.find((l) => l.league_id === preferId) || list[0] || null);
+  }
+
+  async function handleLeaveLeague() {
+    setGeneralMsg('');
+    const { error } = await supabase.rpc('leave_league', { p_league_id: activeLeague.league_id });
+    if (error) { setLeagueExitConfirm(null); setGeneralMsg(error.message); return; }
+    localStorage.removeItem(LAST_LEAGUE_KEY);
+    setLeagueExitConfirm(null);
+    setShowLeagueSettings(false);
+    setSettingsSection(null);
+    refreshLeagues();
+  }
+
+  async function handleDeleteLeague() {
+    setGeneralMsg('');
+    const { error } = await supabase.rpc('delete_league', { p_league_id: activeLeague.league_id });
+    if (error) { setLeagueExitConfirm(null); setGeneralMsg(error.message); return; }
+    localStorage.removeItem(LAST_LEAGUE_KEY);
+    setLeagueExitConfirm(null);
+    setShowLeagueSettings(false);
+    setSettingsSection(null);
+    refreshLeagues();
   }
 
   async function handleCreateLeague() {
@@ -1240,6 +1917,20 @@ function minutesUntilAuction() {
     ? Number(newRelegationTiers) * Number(newNumTeams)
     : 0;
 
+  // The league's own promote/relegate count drives how many rows are shaded at
+  // each end of the standings; the per-tier value is only a fallback for a
+  // league that predates the setting.
+  const promoteRelegateCount = Math.max(
+    1,
+    Number(leagueRosterSpec?.promote_relegate_count)
+      || Number(myTierStandings?.promote_count)
+      || 1
+  );
+
+  // 'pending' means it hasn't kicked off and 'ended' means it's over; anything
+  // in between is an auction in progress that everyone should be able to join.
+  const draftIsLive = draftPhase !== null && draftPhase !== 'pending' && draftPhase !== 'ended';
+
   return (
     <div className="home-grid">
       {tooltip && (
@@ -1297,7 +1988,11 @@ function minutesUntilAuction() {
         </ul>
         <div className="muted-text" style={{ fontSize: '0.8rem', marginTop: 6 }}>*Click to Expand rankings</div>
       </div>
-      <div className={`quadrant quadrant-2 ${mobileActiveTab === 'home' ? 'mobile-active' : ''}`}>
+      <div
+        className={`quadrant quadrant-2 ${mobileActiveTab === 'home' ? 'mobile-active' : ''} ${teamPanel.isFullscreen ? 'panel-fullscreen' : ''}`}
+        {...teamPanel.holdProps}
+      >
+        {teamPanel.isFullscreen && <div className="fullscreen-hint">Hold 2.5s or press Esc to shrink</div>}
         {!activeLeague ? (
           <div style={{ position: 'relative' }}>
 
@@ -1375,13 +2070,13 @@ function minutesUntilAuction() {
               </div>
               {(() => {
   const minsLeft = minutesUntilAuction();
-  if (minsLeft !== null && minsLeft <= 60) {
+  if (draftIsLive || (minsLeft !== null && minsLeft <= 60)) {
     return (
       <button
         onClick={() => onNavigate('draft-room', activeLeague)}
         style={{ background: 'var(--color-error)', color: '#fff', fontWeight: 'bold', fontSize: '1.1rem', padding: '10px 24px' }}
       >
-        Enter Draft Room
+        {draftIsLive ? 'Draft Live — Enter Draft Room' : 'Enter Draft Room'}
       </button>
     );
   }
@@ -1491,20 +2186,21 @@ function minutesUntilAuction() {
                   {(() => {
                     const myRows = buildRosterSlotsFor(teamSignings);
                     const oppRows = buildRosterSlotsFor(opponentSignings);
-                    const rowCount = Math.min(Math.max(myRows.length, oppRows.length), 9);
+                    // Every slot the league defines gets a row, bench included —
+                    // the panel tightens up instead of truncating the roster.
+                    const rowCount = Math.max(myRows.length, oppRows.length);
 
                     // Vertical-only sizing: stays full-size through 7 total roster
-                    // slots, shrinks a little at 8 and a little more at 9 — anything
-                    // beyond 9 is simply not rendered at all (rowCount above already
-                    // caps the loop there).
+                    // slots and tightens from there, down to a 1px floor.
                     const totalSlots = leagueRosterSpec
                       ? (Number(leagueRosterSpec.roster_qb) || 0) + (Number(leagueRosterSpec.roster_rb) || 0)
                         + (Number(leagueRosterSpec.roster_wr) || 0) + (Number(leagueRosterSpec.roster_te) || 0)
                         + (Number(leagueRosterSpec.roster_flex) || 0) + (Number(leagueRosterSpec.roster_superflex) || 0)
                         + (Number(leagueRosterSpec.roster_bench) || 0)
                       : 0;
-                    const shrinkSteps = Math.max(0, Math.min(totalSlots, 9) - 7);
-                    const rowVerticalPadding = Math.max(5 - shrinkSteps * 1.5, 2);
+                    const shrinkSteps = Math.max(0, totalSlots - 7);
+                    const rowVerticalPadding = Math.max(5 - shrinkSteps * 1.5, 1);
+                    const rowFontSize = totalSlots > 11 ? '0.78rem' : '0.85rem';
 
                     return Array.from({ length: rowCount }, (_, i) => {
                       const mine = myRows[i];
@@ -1512,18 +2208,22 @@ function minutesUntilAuction() {
                       const myCost = mine?.player ? contractCostAtWeek(mine.player, currentLeagueWeek) : null;
                       const oppCost = opp?.player ? contractCostAtWeek(opp.player, currentLeagueWeek) : null;
                       const position = mine?.position || opp?.position;
+                      // Bench players are on the roster but not in the lineup, so
+                      // their names read a step quieter than the starters'.
+                      const benchRow = position === 'BENCH';
+                      const nameOpacity = benchRow ? 0.55 : 1;
                       return (
-                        <div key={i} style={{ display: 'grid', gridTemplateColumns: '8% 1fr 6% 7% 6% 1fr 8%', gap: 4, alignItems: 'center', padding: `${rowVerticalPadding}px 0`, borderBottom: '1px solid var(--color-border-subtle)', fontSize: '0.85rem' }}>
+                        <div key={i} style={{ display: 'grid', gridTemplateColumns: '8% 1fr 6% 7% 6% 1fr 8%', gap: 4, alignItems: 'center', padding: `${rowVerticalPadding}px 0`, borderBottom: '1px solid var(--color-border-subtle)', fontSize: rowFontSize }}>
                           <span className="muted-text" style={{ fontSize: '0.7rem' }}>
                             {mine?.player && myCost ? <>${myCost.cost.toFixed(0)}/{myCost.weeksRemaining}</> : ''}
                           </span>
-                          <span style={{ color: mine?.player ? (NFL_TEAM_COLORS[mine.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
+                          <span style={{ opacity: nameOpacity, color: mine?.player ? (NFL_TEAM_COLORS[mine.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
                             {mine?.player ? mine.player.full_name : '—'}
                           </span>
                           <span className="muted-text" style={{ textAlign: 'right', fontSize: '0.75rem' }}>—</span>
-                          <span className="roster-slot-badge" style={{ background: POSITION_SLOT_COLORS[position], textAlign: 'center', justifySelf: 'center' }}>{position}</span>
+                          <span className="roster-slot-badge" style={{ background: POSITION_SLOT_COLORS[position], textAlign: 'center', justifySelf: 'center' }}>{SLOT_BADGE_LABEL[position] || position}</span>
                           <span className="muted-text" style={{ fontSize: '0.75rem' }}>—</span>
-                          <span style={{ textAlign: 'right', color: opp?.player ? (NFL_TEAM_COLORS[opp.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
+                          <span style={{ textAlign: 'right', opacity: nameOpacity, color: opp?.player ? (NFL_TEAM_COLORS[opp.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
                             {opp?.player ? opp.player.full_name : '—'}
                           </span>
                           <span className="muted-text" style={{ textAlign: 'right', fontSize: '0.7rem' }}>
@@ -1604,18 +2304,23 @@ function minutesUntilAuction() {
 
                           const isMyTeam = activeLeague.team_id === t.team_id;
 
+                          // How many go up and down comes from the league's own
+                          // "teams relegated / promoted each season" setting, so
+                          // a league that moves three teams highlights three —
+                          // not just the single team at each end.
                           const inPromoZone = isTopTier
-                            ? t.rank === 1
-                            : t.rank <= myTierStandings.promote_count;
-                          const inRelegationZone = !isBottomTier && t.rank > teamCount - myTierStandings.relegate_count;
+                            ? t.rank === 1              // nowhere above tier 1; rank 1 is the champion
+                            : t.rank <= promoteRelegateCount;
+                          const inRelegationZone = !isBottomTier && t.rank > teamCount - promoteRelegateCount;
 
                           let cellClass = '';
                           if (inPromoZone) {
-                            const nextTeam = myTierStandings.teams.find((x) => x.rank === myTierStandings.promote_count + 1);
+                            const cutoff = isTopTier ? 2 : promoteRelegateCount + 1;
+                            const nextTeam = myTierStandings.teams.find((x) => x.rank === cutoff);
                             const clinched = nextTeam ? t.min_possible_wins > nextTeam.max_possible_wins : true;
                             cellClass = clinched ? 'promo-solid' : 'promo-light';
                           } else if (inRelegationZone) {
-                            const prevTeam = myTierStandings.teams.find((x) => x.rank === teamCount - myTierStandings.relegate_count);
+                            const prevTeam = myTierStandings.teams.find((x) => x.rank === teamCount - promoteRelegateCount);
                             const clinched = prevTeam ? t.max_possible_wins < prevTeam.min_possible_wins : true;
                             cellClass = clinched ? 'releg-solid' : 'releg-light';
                           }
@@ -1646,19 +2351,40 @@ function minutesUntilAuction() {
                 )}
               </div>
             </div>
+
+            {teamPanel.isFullscreen && (
+              <FreeAgentBoard
+                league={activeLeague}
+                week={currentLeagueWeek}
+                rosterSpec={leagueRosterSpec}
+                onSigned={() => setRosterVersion((v) => v + 1)}
+              />
+            )}
           </div>
         )}
       </div>
       <div className="bottom-row">
-        <div className={`quadrant ${mobileActiveTab === 'q3' ? 'mobile-active' : ''}`}>Coming soon</div>
-        <div className={`quadrant ${mobileActiveTab === 'q4' ? 'mobile-active' : ''}`}>Coming soon</div>
+        <div
+          className={`quadrant ${mobileActiveTab === 'q3' ? 'mobile-active' : ''} ${q3Panel.isFullscreen ? 'panel-fullscreen' : ''}`}
+          {...q3Panel.holdProps}
+        >
+          {q3Panel.isFullscreen && <div className="fullscreen-hint">Hold 2.5s or press Esc to shrink</div>}
+          Coming soon
+        </div>
+        <div
+          className={`quadrant ${mobileActiveTab === 'q4' ? 'mobile-active' : ''} ${stockPanel.isFullscreen ? 'panel-fullscreen' : ''}`}
+          {...stockPanel.holdProps}
+        >
+          {stockPanel.isFullscreen && <div className="fullscreen-hint">Hold 2.5s or press Esc to shrink</div>}
+          <PlayerStockBoard expanded={stockPanel.isFullscreen} />
+        </div>
       </div>
 
       <nav className="mobile-bottom-nav">
         <button className={mobileActiveTab === 'home' ? 'active' : ''} onClick={() => setMobileActiveTab('home')}>Home</button>
         <button className={mobileActiveTab === 'rankings' ? 'active' : ''} onClick={() => setMobileActiveTab('rankings')}>Rankings</button>
         <button className={mobileActiveTab === 'q3' ? 'active' : ''} onClick={() => setMobileActiveTab('q3')}>Coming Soon</button>
-        <button className={mobileActiveTab === 'q4' ? 'active' : ''} onClick={() => setMobileActiveTab('q4')}>Coming Soon</button>
+        <button className={mobileActiveTab === 'q4' ? 'active' : ''} onClick={() => setMobileActiveTab('q4')}>Stock</button>
       </nav>
 
       {showFullRankings && (
@@ -1950,7 +2676,7 @@ function minutesUntilAuction() {
         </div>
       )}
 
-      {showLeagueSettings && (
+      {showLeagueSettings && activeLeague && (
         <div className="modal-overlay" onClick={() => { setShowLeagueSettings(false); setSettingsSection(null); }}>
           <div className="modal-box modal-box-settings" onClick={(e) => e.stopPropagation()}>
             <h3 style={{ textAlign: 'center', fontFamily: 'Georgia', fontSize: '1.8rem' }}>{activeLeague.league_name} Settings</h3>
@@ -2124,7 +2850,49 @@ function minutesUntilAuction() {
                   )}
                   <button onClick={() => { setShowLeagueSettings(false); setSettingsSection(null); }}>Close</button>
                 </div>
-                {generalMsg && <div className="success-text" style={{ marginTop: 8 }}>{generalMsg}</div>}
+
+                <div className="scoring-subheading" style={{ marginTop: 24 }}>Danger Zone</div>
+                <div className="settings-note" style={{ marginBottom: 10 }}>
+                  {activeLeague.is_owner
+                    ? 'Leaving hands the league to another member. Deleting removes the league, its teams and every contract in it, for everyone. Neither can be undone.'
+                    : 'Leaving gives up your team and every contract on it. This cannot be undone.'}
+                </div>
+                {leagueExitConfirm === null ? (
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button onClick={() => { setGeneralMsg(''); setLeagueExitConfirm('leave'); }}>
+                      Leave League
+                    </button>
+                    {activeLeague.is_owner && (
+                      <button
+                        style={{ background: 'var(--color-error)', color: '#111', fontWeight: 'bold' }}
+                        onClick={() => { setGeneralMsg(''); setLeagueExitConfirm('delete'); }}
+                      >
+                        Delete League
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span className="error-text" style={{ fontSize: '0.85rem' }}>
+                      {leagueExitConfirm === 'delete'
+                        ? `Permanently delete ${activeLeague.league_name}?`
+                        : `Leave ${activeLeague.league_name}?`}
+                    </span>
+                    <button
+                      style={{ background: 'var(--color-error)', color: '#111', fontWeight: 'bold' }}
+                      onClick={leagueExitConfirm === 'delete' ? handleDeleteLeague : handleLeaveLeague}
+                    >
+                      Yes, {leagueExitConfirm === 'delete' ? 'delete it' : 'leave'}
+                    </button>
+                    <button onClick={() => setLeagueExitConfirm(null)}>Cancel</button>
+                  </div>
+                )}
+
+                {generalMsg && (
+                  <div className={generalMsg === 'Saved.' ? 'success-text' : 'error-text'} style={{ marginTop: 8 }}>
+                    {generalMsg}
+                  </div>
+                )}
               </div>
             )}
 
@@ -2654,6 +3422,39 @@ function minutesUntilAuction() {
                     </ul>
                   </div>
                 ))}
+
+                {activeLeague.is_owner && relegationTiers.length > 1 && (
+                  <div style={{ marginTop: 18, paddingTop: 14, borderTop: '1px solid var(--color-border-subtle)' }}>
+                    <div className="scoring-subheading" style={{ marginTop: 0 }}>End of Season</div>
+                    <div className="settings-note" style={{ marginBottom: 10 }}>
+                      Promotes the top {promoteRelegateCount} and relegates the bottom {promoteRelegateCount} of every
+                      tier, using the final standings. Run this once, after the last week has been scored.
+                    </div>
+                    {!confirmingRelegationRun ? (
+                      <button style={{ color: 'var(--color-success)' }} onClick={() => setConfirmingRelegationRun(true)}>
+                        Run Promotion &amp; Relegation
+                      </button>
+                    ) : (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span className="error-text" style={{ fontSize: '0.8rem' }}>This moves teams for real. Are you sure?</span>
+                        <button style={{ background: 'var(--color-success)', color: '#111' }} onClick={handleRunRelegation}>Yes</button>
+                        <button onClick={() => setConfirmingRelegationRun(false)}>Cancel</button>
+                      </div>
+                    )}
+                    {relegationMoves && relegationMoves.length > 0 && (
+                      <ul className="rankings-list">
+                        {relegationMoves.map((m) => (
+                          <li key={m.team_id} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span>{m.team_name}</span>
+                            <span className={m.movement === 'promoted' ? 'promo-solid' : 'releg-solid'}>
+                              Tier {m.from_tier} → {m.to_tier}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
 
                 {relegationMsg && (
                   <div className={relegationMsg === 'Saved.' ? 'success-text' : 'error-text'} style={{ marginTop: 8 }}>

@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useRef, useState } from 'react';
 import { supabase } from '../supabaseClient';
-import { formatMatchup, MAX_CONTRACT_WEEKS } from '../draftControls';
+import { useHoldToFullscreen } from '../holdToFullscreen';
+import { canFitPosition, countByPosition, formatMatchup, MAX_CONTRACT_WEEKS, positionBlockedReason } from '../draftControls';
 
 const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
 
@@ -259,6 +260,12 @@ export default function MockDraft({ league, profile, onBack }) {
   const [seasonStats2024, setSeasonStats2024] = useState({});
   const [statsView, setStatsView] = useState('current');
   const [hiddenWeeks, setHiddenWeeks] = useState([]);
+
+  // Press and hold for 2.5s inside a panel to blow it up full screen.
+  const rosterPanel = useHoldToFullscreen();
+  const boardPanel = useHoldToFullscreen();
+  const piePanel = useHoldToFullscreen();
+  const poolPanel = useHoldToFullscreen();
   const holdTimerRef = useRef(null);
 
   // --- Turn-based nomination phase state ---
@@ -293,7 +300,7 @@ export default function MockDraft({ league, profile, onBack }) {
     setTeamName(league.team_name || 'My Team');
     supabase
       .from('leagues')
-      .select('players_per_auction, salary_cap, initial_countdown_minutes, min_bid_reset_seconds, initial_draft_at, interest_rate_per_week, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex')
+      .select('players_per_auction, salary_cap, initial_countdown_minutes, min_bid_reset_seconds, initial_draft_at, interest_rate_per_week, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, max_draft_qb, max_draft_rb, max_draft_wr, max_draft_te')
       .eq('id', league.league_id)
       .single()
       .then(({ data }) => {
@@ -541,6 +548,11 @@ function buildNominationRound(order, startIndex, myTeamName) {
   function nominatePlayer(player) {
     const mySlot = myPendingNominationSlot();
     if (!mySlot) return;
+    // Nominating is an opening bid, so it obeys the same roster-slot rule.
+    if (!canBidOnPlayer(player)) {
+      setError(bidBlockedReason(player));
+      return;
+    }
     setRankedPlayers((pool) => pool.filter((p) => p.sleeper_id !== player.sleeper_id));
     setNominationSlots(nominationSlots.map((s) => (s === mySlot ? { ...s, player } : s)));
   }
@@ -598,10 +610,40 @@ function buildNominationRound(order, startIndex, myTeamName) {
     setHiddenWeeks((prev) => prev.slice(0, -1));
   }
 
+  // What my roster would look like counting everything already won plus every
+  // slot I'm currently leading. `excludeSlotKey` leaves out the slot being
+  // judged, so a player I'm already winning never blocks my own re-bid on him.
+  function myRosterCounts(excludeSlotKey) {
+    const players = wonPlayers.map((w) => w.player);
+    for (const other of slots) {
+      if (other.key === excludeSlotKey) continue;
+      if (other.completed) continue;
+      if (other.highBidder !== 'me') continue;
+      players.push(other.player);
+    }
+    return countByPosition(players);
+  }
+
+  // A player with nowhere to sit on my roster can't be bid on at all — the
+  // opening bid that comes with a nomination included.
+  function canBidOnPlayer(player, excludeSlotKey) {
+    if (!player) return false;
+    return canFitPosition(leagueRosterSpec, myRosterCounts(excludeSlotKey), player.player_position);
+  }
+
+  function bidBlockedReason(player, excludeSlotKey) {
+    if (!player) return null;
+    return positionBlockedReason(leagueRosterSpec, myRosterCounts(excludeSlotKey), player.player_position);
+  }
+
   function submitBid(key, amountOverride, weeksOverride) {
     const s = slots.find((row) => row.key === key);
     if (!s || s.completed) return;
     if (s.highBidder === 'me') return; // already leading — locked until outbid
+    if (!canBidOnPlayer(s.player, key)) {
+      setError(bidBlockedReason(s.player, key));
+      return;
+    }
     const amount = Number(amountOverride ?? s.myBidAmount);
     const rawWeeks = Number(weeksOverride ?? s.myWeeks);
     const weeksEntered = rawWeeks > 0 ? rawWeeks : 1;
@@ -646,18 +688,22 @@ function buildNominationRound(order, startIndex, myTeamName) {
       ['QB', leagueRosterSpec.roster_qb], ['RB', leagueRosterSpec.roster_rb],
       ['WR', leagueRosterSpec.roster_wr], ['TE', leagueRosterSpec.roster_te],
       ['FLEX', leagueRosterSpec.roster_flex], ['SFLEX', leagueRosterSpec.roster_superflex],
+      ['BE', leagueRosterSpec.roster_bench],
     ];
+    const poolForWildcardSlots = wonPlayers;
     const byPosition = { QB: [], RB: [], WR: [], TE: [] };
     wonPlayers.forEach((w) => { if (byPosition[w.player.player_position]) byPosition[w.player.player_position].push(w); });
     const used = new Set();
     const rosterSlots = [];
     for (const [pos, count] of positionCounts) {
-      for (let i = 0; i < count; i++) {
+      for (let i = 0; i < (count || 0); i++) {
         let won = null;
         if (['QB', 'RB', 'WR', 'TE'].includes(pos)) {
           won = byPosition[pos].find((w) => !used.has(w.player.sleeper_id)) || null;
-        } else {
+        } else if (pos === 'FLEX') {
           won = ['RB', 'WR', 'TE'].flatMap((p) => byPosition[p]).find((w) => !used.has(w.player.sleeper_id)) || null;
+        } else {
+          won = poolForWildcardSlots.find((w) => !used.has(w.player.sleeper_id)) || null;
         }
         if (won) used.add(won.player.sleeper_id);
         rosterSlots.push({ position: pos, won });
@@ -672,19 +718,23 @@ function buildNominationRound(order, startIndex, myTeamName) {
       ['QB', leagueRosterSpec.roster_qb], ['RB', leagueRosterSpec.roster_rb],
       ['WR', leagueRosterSpec.roster_wr], ['TE', leagueRosterSpec.roster_te],
       ['FLEX', leagueRosterSpec.roster_flex], ['SFLEX', leagueRosterSpec.roster_superflex],
+      ['BE', leagueRosterSpec.roster_bench],
     ];
     const teamPicks = allWonPlayers.filter((w) => w.teamName === teamName);
+    const poolForWildcardSlots = teamPicks;
     const byPosition = { QB: [], RB: [], WR: [], TE: [] };
     teamPicks.forEach((w) => { if (byPosition[w.player.player_position]) byPosition[w.player.player_position].push(w); });
     const used = new Set();
     const rosterSlots = [];
     for (const [pos, count] of positionCounts) {
-      for (let i = 0; i < count; i++) {
+      for (let i = 0; i < (count || 0); i++) {
         let won = null;
         if (['QB', 'RB', 'WR', 'TE'].includes(pos)) {
           won = byPosition[pos].find((w) => !used.has(w.player.sleeper_id)) || null;
-        } else {
+        } else if (pos === 'FLEX') {
           won = ['RB', 'WR', 'TE'].flatMap((p) => byPosition[p]).find((w) => !used.has(w.player.sleeper_id)) || null;
+        } else {
+          won = poolForWildcardSlots.find((w) => !used.has(w.player.sleeper_id)) || null;
         }
         if (won) used.add(won.player.sleeper_id);
         rosterSlots.push({ position: pos, won });
@@ -775,6 +825,8 @@ function buildNominationRound(order, startIndex, myTeamName) {
   });
 
   const canNominate = myPendingNominationSlot() !== null;
+  // Computed once per render rather than per row — the undrafted table is long.
+  const nominationRosterCounts = myRosterCounts();
 
   if (!started) {
     return (
@@ -830,7 +882,10 @@ function buildNominationRound(order, startIndex, myTeamName) {
       )}
 
       {/* My Team box — top right */}
-      <div style={{
+      <div
+        className={rosterPanel.isFullscreen ? 'panel-fullscreen' : undefined}
+        {...rosterPanel.holdProps}
+        style={{
         width: 400, height: 400, background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
         position: 'absolute', top: 25, right: 25, padding: 14, boxSizing: 'border-box',
@@ -907,7 +962,10 @@ function buildNominationRound(order, startIndex, myTeamName) {
       </div>
 
       {/* Auction / nomination board — top left */}
-      <div style={{
+      <div
+        className={boardPanel.isFullscreen ? 'panel-fullscreen' : undefined}
+        {...boardPanel.holdProps}
+        style={{
         width: 980, height: 520, background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
         position: 'absolute', top: 25, left: 25, padding: 14, boxSizing: 'border-box',
@@ -1015,6 +1073,10 @@ function buildNominationRound(order, startIndex, myTeamName) {
               const secondsLeft = Math.max(0, Math.round((s.timerEndsAt - tick) / 1000));
               const sizing = getCardSizing(playersPerAuction);
               const projectedValue = salaryCap * (Number(s.player.cap_percent) || 0) / 100;
+              // No open slot for this position means the whole bid control is
+              // dead for me — leading on him already is the one exception.
+              const rosterFull = !isMyBid && !canBidOnPlayer(s.player, s.key);
+              const rosterFullReason = rosterFull ? bidBlockedReason(s.player, s.key) : undefined;
 
               if (s.completed) {
                 return (
@@ -1079,7 +1141,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
                           <span>$</span>
                           <input
                             type="number"
-                            disabled={isMyBid}
+                            disabled={isMyBid || rosterFull}
                             value={s.myBidAmount}
                             onChange={(e) => {
                               const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
@@ -1092,7 +1154,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
                           <span>/</span>
                           <input
                             type="number"
-                            disabled={isMyBid}
+                            disabled={isMyBid || rosterFull}
                             value={s.myWeeks}
                             onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
                             style={{ width: 44 }}
@@ -1101,11 +1163,12 @@ function buildNominationRound(order, startIndex, myTeamName) {
                         </div>
 
                         <button
-                          disabled={!(Number(s.myBidAmount) > s.highBid)}
+                          disabled={rosterFull || !(Number(s.myBidAmount) > s.highBid)}
                           onClick={() => submitBid(s.key)}
+                          title={rosterFullReason}
                           style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
                         >
-                          {isMyBid ? 'Leading' : 'Submit Bid'}
+                          {isMyBid ? 'Leading' : rosterFull ? 'No Roster Slot' : 'Submit Bid'}
                         </button>
 
                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
@@ -1292,7 +1355,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
                     <span>$</span>
                     <input
                       type="number"
-                      disabled={isMyBid}
+                      disabled={isMyBid || rosterFull}
                       value={s.myBidAmount}
                       onChange={(e) => {
                         const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
@@ -1305,7 +1368,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
                     <span>/</span>
                     <input
                       type="number"
-                      disabled={isMyBid}
+                      disabled={isMyBid || rosterFull}
                       value={s.myWeeks}
                       onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
                       style={{ width: 36, padding: '2px 4px' }}
@@ -1314,11 +1377,12 @@ function buildNominationRound(order, startIndex, myTeamName) {
                   </div>
 
                   <button
-                    disabled={!(Number(s.myBidAmount) > s.highBid)}
+                    disabled={rosterFull || !(Number(s.myBidAmount) > s.highBid)}
                     onClick={() => submitBid(s.key)}
+                    title={rosterFullReason}
                     style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
                   >
-                    {isMyBid ? 'Leading' : 'Submit Bid'}
+                    {isMyBid ? 'Leading' : rosterFull ? 'No Roster Slot' : 'Submit Bid'}
                   </button>
 
             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
@@ -1330,7 +1394,10 @@ function buildNominationRound(order, startIndex, myTeamName) {
       </div>
 
       {/* Pie chart grid — bottom right */}
-      <div style={{
+      <div
+        className={piePanel.isFullscreen ? 'panel-fullscreen' : undefined}
+        {...piePanel.holdProps}
+        style={{
         width: 400, height: 390, background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
         position: 'absolute', bottom: 50, right: 25, padding: 10, boxSizing: 'border-box',
@@ -1347,6 +1414,9 @@ function buildNominationRound(order, startIndex, myTeamName) {
             return (
               <div
                 key={week}
+                // Its own 600ms hold hides the week, so the panel-level
+                // hold-to-fullscreen gesture must not also start here.
+                data-no-fullscreen
                 style={{ textAlign: 'center', userSelect: 'none' }}
                 onMouseDown={() => startHoldToHide(week)}
                 onMouseUp={cancelHold}
@@ -1414,7 +1484,10 @@ function buildNominationRound(order, startIndex, myTeamName) {
       </div>
 
       {/* Undrafted players — bottom left */}
-      <div style={{
+      <div
+        className={poolPanel.isFullscreen ? 'panel-fullscreen' : undefined}
+        {...poolPanel.holdProps}
+        style={{
         width: 980, height: 280, background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
         position: 'absolute', bottom: 90, left: 25, padding: 14, boxSizing: 'border-box',
@@ -1491,6 +1564,7 @@ function buildNominationRound(order, startIndex, myTeamName) {
               const statRow = statsView !== 'projected' ? statsRowFor(p, statsView) : null;
               const isQB = p.player_position === 'QB';
               const isSkill = ['RB', 'WR', 'TE'].includes(p.player_position);
+              const positionFull = !canFitPosition(leagueRosterSpec, nominationRosterCounts, p.player_position);
               return (
                 <tr key={p.sleeper_id} style={{ background: POSITION_ROW_TINT[p.player_position] || 'transparent' }}>
                   <td style={{ whiteSpace: 'nowrap' }}>{p.rank ?? '-'}</td>
@@ -1515,20 +1589,21 @@ function buildNominationRound(order, startIndex, myTeamName) {
                   <td>${(salaryCap * (Number(p.cap_percent) || 0) / 100).toFixed(2)}</td>
                   <td style={{ textAlign: 'right' }}>
                     <button
-                      disabled={!canNominate}
+                      disabled={!canNominate || positionFull}
                       onClick={() => nominatePlayer(p)}
-                      className={canNominate ? 'bid-flash' : ''}
+                      className={canNominate && !positionFull ? 'bid-flash' : ''}
+                      title={positionFull ? positionBlockedReason(leagueRosterSpec, nominationRosterCounts, p.player_position) : undefined}
                       style={{
                         padding: '2px 10px',
                         fontSize: '0.8rem',
                         borderRadius: '10px',
                         fontWeight: 'bold',
-                        background: '#fff',
-                        color: '#111',
-                        cursor: canNominate ? 'pointer' : 'not-allowed',
+                        background: positionFull ? 'var(--color-button-bg)' : '#fff',
+                        color: positionFull ? 'var(--color-text-muted)' : '#111',
+                        cursor: canNominate && !positionFull ? 'pointer' : 'not-allowed',
                       }}
                     >
-                      Bid
+                      {positionFull ? 'Full' : 'Bid'}
                     </button>
                   </td>
                 </tr>

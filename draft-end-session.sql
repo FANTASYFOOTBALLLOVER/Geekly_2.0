@@ -13,6 +13,16 @@
 -- from a league member and makes it stick for everyone.
 -- ============================================================
 
+-- The room also needs to know *when* the draft ended, so it can hold the
+-- "draft has ended" screen for half an hour and then turn back into a
+-- countdown to the next weekly auction. Existing finished drafts are stamped
+-- once here so they don't sit on that screen forever.
+alter table draft_sessions add column if not exists ended_at timestamptz;
+
+update draft_sessions
+   set ended_at = coalesce(ended_at, now())
+ where phase = 'ended';
+
 create or replace function draft_end_session(p_league_id bigint)
 returns void as $$
 begin
@@ -32,7 +42,8 @@ begin
   -- A draft that never started stays pending, and one already ended stays
   -- ended — this only closes out an auction that is genuinely in progress.
   update draft_sessions
-     set phase = 'ended'
+     set phase = 'ended',
+         ended_at = now()
    where league_id = p_league_id
      and phase not in ('pending', 'ended');
 end;

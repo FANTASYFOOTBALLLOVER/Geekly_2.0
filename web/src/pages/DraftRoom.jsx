@@ -1,6 +1,7 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { supabase } from '../supabaseClient';
-import { formatMatchup, MAX_CONTRACT_WEEKS, MIN_BID } from '../draftControls';
+import { useHoldToFullscreen } from '../holdToFullscreen';
+import { canFitPosition, countByPosition, formatMatchup, MAX_CONTRACT_WEEKS, MIN_BID, positionBlockedReason } from '../draftControls';
 
 const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
 
@@ -30,6 +31,15 @@ const AUTO_START_RETRY_MS = 10000;
 const END_CHECK_RETRY_MS = 10000;
 const CPU_NOMINATE_DELAY_MS = 1000;
 const WINNERS_DISPLAY_MS = 2000;
+// How long the room keeps showing "the draft has ended" before it turns back
+// into a countdown to the next weekly auction.
+const POST_DRAFT_HOLD_MS = 30 * 60 * 1000;
+// Floor between two draft_advance_phase calls from the same browser once a
+// deadline has actually passed...
+const ADVANCE_RETRY_MS = 1500;
+// ...and the much slower background cadence used the rest of the time, so any
+// server-side upkeep that isn't tied to a visible timer still happens.
+const IDLE_ADVANCE_MS = 5000;
 
 function Crest({ pattern, color1, color2, size = 28, onClick }) {
   const clipId = `crest-${pattern}-${(color1 || '').replace('#', '')}-${(color2 || '').replace('#', '')}`;
@@ -275,6 +285,7 @@ export default function DraftRoom({ league, profile, onBack }) {
   const [weeklyAuctionDay, setWeeklyAuctionDay] = useState(null);
   const [weeklyAuctionTime, setWeeklyAuctionTime] = useState(null);
   const [scheduleLoaded, setScheduleLoaded] = useState(false);
+  const [week1EndsAt, setWeek1EndsAt] = useState(null);
   const [draftPoolLoaded, setDraftPoolLoaded] = useState(false);
   const [showDraftSettings, setShowDraftSettings] = useState(false);
   const [editableCountdownMinutes, setEditableCountdownMinutes] = useState(2);
@@ -306,6 +317,12 @@ export default function DraftRoom({ league, profile, onBack }) {
   const [hiddenWeeks, setHiddenWeeks] = useState([]);
   const holdTimerRef = useRef(null);
 
+  // Press and hold for 2.5s inside a panel to blow it up full screen.
+  const rosterPanel = useHoldToFullscreen();
+  const boardPanel = useHoldToFullscreen();
+  const piePanel = useHoldToFullscreen();
+  const poolPanel = useHoldToFullscreen();
+
   // --- Real shared draft state, synced live from Supabase across every connected browser ---
   const [session, setSession] = useState(null);
   const sessionRef = useRef(null);
@@ -319,6 +336,7 @@ export default function DraftRoom({ league, profile, onBack }) {
   const prevAuctionSlotsRef = useRef([]);
   const nextAutoStartAttemptRef = useRef(0);
   const nextEndCheckAttemptRef = useRef(0);
+  const nextAdvanceAttemptRef = useRef(0);
 
   const rankedPlayersRef = useRef(rankedPlayers);
   rankedPlayersRef.current = rankedPlayers;
@@ -355,7 +373,7 @@ export default function DraftRoom({ league, profile, onBack }) {
     setTeamName(league.team_name || 'My Team');
     supabase
       .from('leagues')
-      .select('initial_draft_at, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench')
+      .select('initial_draft_at, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, max_draft_qb, max_draft_rb, max_draft_wr, max_draft_te')
       .eq('id', league.league_id)
       .single()
       .then(({ data }) => {
@@ -422,6 +440,26 @@ export default function DraftRoom({ league, profile, onBack }) {
     return () => clearInterval(interval);
   }, []);
 
+  // The first weekly auction can never land before NFL week 1 has finished
+  // playing, so pin it to the last week-1 kickoff date (Monday night) and let
+  // the league's chosen Tue/Wed/Thu slot fall on the far side of it.
+  useEffect(() => {
+    supabase
+      .from('games')
+      .select('game_date')
+      .eq('season', 2026)
+      .eq('season_type', 'REG')
+      .eq('week', 1)
+      .order('game_date', { ascending: false })
+      .limit(1)
+      .then(({ data, error: gamesErr }) => {
+        if (gamesErr) { console.error('week 1 schedule fetch failed:', gamesErr); return; }
+        const lastGameDate = data && data[0] && data[0].game_date;
+        if (!lastGameDate) return;
+        setWeek1EndsAt(new Date(easternWallClockToUTCISOStringHelper(`${lastGameDate}T23:59`)));
+      });
+  }, []);
+
   // Set up the shared session row + subscribe to live updates from every
   // other connected browser in this league's draft
 useEffect(() => {
@@ -454,15 +492,52 @@ useEffect(() => {
     if (channel) supabase.removeChannel(channel);
   };
 }, [league]);
-  // Heartbeat: every tick, ask the server to resolve any deadline that may
-  // have passed. Cheap and safe to call redundantly — every other connected
-  // browser is calling this too, and the server guards against double-firing.
- useEffect(() => {
-  if (!league || !session || session.phase === 'pending' || session.phase === 'ended') return;
-  supabase.rpc('draft_advance_phase', { p_league_id: league.league_id }).then(({ error: advErr }) => {
-    if (advErr) console.error('draft_advance_phase failed:', advErr);
-  });
-}, [tick, league, session?.phase]);
+  // The soonest moment the server could have something to resolve. Until it
+  // arrives there is nothing to ask about.
+  function earliestDeadline() {
+    if (!session) return null;
+    if (session.phase === 'nomination') return nominationTimerEndsAt;
+    if (session.phase === 'winners') return winnersShownAt ? winnersShownAt + WINNERS_DISPLAY_MS : null;
+    if (session.phase === 'auction') {
+      const live = slots.filter((s) => !s.completed).map((s) => s.timerEndsAt);
+      return live.length > 0 ? Math.min(...live) : 0; // every slot settled — resolve now
+    }
+    return null;
+  }
+
+  // Heartbeat. This used to fire once a second from every browser in the room,
+  // so a ten-person draft put ten phase-resolution calls a second through the
+  // database and every one of them wrote the session row back — which is what
+  // made bids crawl in. It now fires the instant a timer runs out and only
+  // every five seconds otherwise, so the room stays responsive where it
+  // matters and quiet where it doesn't.
+  useEffect(() => {
+    if (!league || !session) return;
+    if (session.phase === 'pending' || session.phase === 'ended') return;
+
+    // A deadline that has come and gone needs resolving right away. The rest
+    // of the time we still check in, just far less often. Paused counts as due
+    // so that whatever the server does to hold the clocks keeps happening.
+    const deadline = earliestDeadline();
+    const due = session.paused || deadline === null || tick >= deadline;
+    if (tick < nextAdvanceAttemptRef.current) return;
+    nextAdvanceAttemptRef.current = tick + (due ? ADVANCE_RETRY_MS : IDLE_ADVANCE_MS);
+
+    supabase.rpc('draft_advance_phase', { p_league_id: league.league_id }).then(({ error: advErr }) => {
+      if (advErr) console.error('draft_advance_phase failed:', advErr);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tick, league, session]);
+
+  async function refreshSession() {
+    if (!league) return;
+    const { data } = await supabase
+      .from('draft_sessions')
+      .select('*')
+      .eq('league_id', league.league_id)
+      .maybeSingle();
+    if (data) setSession(data);
+  }
 
   async function loadDraftPool() {
     setError('');
@@ -588,11 +663,18 @@ useEffect(() => {
   async function nominatePlayer(player) {
     const mySlot = myPendingNominationSlot();
     if (!mySlot) return;
+    // Nominating is an opening bid, so it obeys the same roster-slot rule.
+    if (!canBidOnPlayer(player)) {
+      setError(bidBlockedReason(player));
+      return;
+    }
     const { error: nomErr } = await supabase.rpc('draft_nominate_player', {
       p_league_id: league.league_id, p_team_id: league.team_id, p_sleeper_id: player.sleeper_id,
     });
     if (nomErr) { setError(nomErr.message); return; }
     setRankedPlayers((pool) => pool.filter((p) => p.sleeper_id !== player.sleeper_id));
+    // Same reason as a bid: show my own nomination without the round trip.
+    refreshSession();
   }
 
   function updateSlotBidAmount(key, value) {
@@ -652,10 +734,41 @@ useEffect(() => {
     setHiddenWeeks((prev) => prev.slice(0, -1));
   }
 
+  // What my roster would look like counting everything already signed plus
+  // every slot I'm currently leading — those are contracts in all but name.
+  // `excludeSlotKey` leaves out the slot being judged, so a player I'm already
+  // winning never blocks my own re-bid on him.
+  function myRosterCounts(excludeSlotKey) {
+    const players = wonPlayers.map((w) => w.player);
+    for (const other of slots) {
+      if (other.key === excludeSlotKey) continue;
+      if (other.completed) continue;
+      if (other.highBidder !== 'me') continue;
+      players.push(other.player);
+    }
+    return countByPosition(players);
+  }
+
+  // A player with nowhere to sit on my roster can't be bid on at all — the
+  // opening bid that comes with a nomination included.
+  function canBidOnPlayer(player, excludeSlotKey) {
+    if (!player) return false;
+    return canFitPosition(leagueRosterSpec, myRosterCounts(excludeSlotKey), player.player_position);
+  }
+
+  function bidBlockedReason(player, excludeSlotKey) {
+    if (!player) return null;
+    return positionBlockedReason(leagueRosterSpec, myRosterCounts(excludeSlotKey), player.player_position);
+  }
+
   async function submitBid(key, amountOverride, weeksOverride) {
     const s = slots.find((row) => row.key === key);
     if (!s || s.completed) return;
     if (s.highBidder === 'me') return; // already leading — locked until outbid
+    if (!canBidOnPlayer(s.player, key)) {
+      setError(bidBlockedReason(s.player, key));
+      return;
+    }
     const amount = Number(amountOverride ?? s.myBidAmount);
     const rawWeeks = Number(weeksOverride ?? s.myWeeks);
     const weeksEntered = rawWeeks > 0 ? rawWeeks : 1;
@@ -684,6 +797,8 @@ useEffect(() => {
     });
     if (bidErr) { setError(bidErr.message); return; }
     setMyWeeksInputs((prev) => ({ ...prev, [key]: String(weeksEntered) }));
+    // Don't sit on a stale board waiting for the realtime echo of my own bid.
+    refreshSession();
   }
 
   function buildRosterSlotsForTeam(teamId) {
@@ -865,10 +980,21 @@ useEffect(() => {
   }, [league]);
 
   useEffect(() => {
-    if (phase !== 'winners') return;
+    if (phase !== 'winners' && phase !== 'ended') return;
     loadSignings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
+
+  // With several players up at once, slots settle one at a time while the phase
+  // stays 'auction' — waiting for the round to end is what left a player you
+  // just won missing from your roster until you reloaded. Refetch as soon as
+  // the set of settled slots changes.
+  const settledSlotKeys = slots.filter((s) => s.completed).map((s) => s.key).sort().join('|');
+  useEffect(() => {
+    if (!settledSlotKeys) return;
+    loadSignings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settledSlotKeys]);
 
   useEffect(() => {
     if (phase !== 'auction' || playersPerAuction !== 1 || slots.length === 0) return;
@@ -932,24 +1058,114 @@ useEffect(() => {
       ].filter(Boolean)
     : ['QB', 'RB', 'WR', 'TE'];
 
-  const usedSleeperIds = session?.used_sleeper_ids || [];
-  const filteredUndrafted = rankedPlayers.filter((p) => {
-    if (usedSleeperIds.includes(p.sleeper_id)) return false;
-    const matchesSearch = !searchText || p.full_name.toLowerCase().includes(searchText.toLowerCase());
-    const matchesPos = positionFilter === 'ALL' || p.player_position === positionFilter;
-    return matchesSearch && matchesPos;
-  });
+  // A Set rather than Array.includes: this list is a thousand players long and
+  // used to be re-scanned linearly, for every player, on every one-second tick.
+  const usedSleeperIds = useMemo(
+    () => new Set(session?.used_sleeper_ids || []),
+    [session?.used_sleeper_ids]
+  );
+  const filteredUndrafted = useMemo(
+    () => rankedPlayers.filter((p) => {
+      if (usedSleeperIds.has(p.sleeper_id)) return false;
+      const matchesSearch = !searchText || p.full_name.toLowerCase().includes(searchText.toLowerCase());
+      const matchesPos = positionFilter === 'ALL' || p.player_position === positionFilter;
+      return matchesSearch && matchesPos;
+    }),
+    [rankedPlayers, usedSleeperIds, searchText, positionFilter]
+  );
 
   const canNominate = myPendingNominationSlot() !== null;
+  // Computed once per render rather than per row — the undrafted table is long.
+  const nominationRosterCounts = myRosterCounts();
+
+  // The undrafted table is the most expensive thing on the screen, and none of
+  // it depends on the clock. Rebuilding it only when the draft state actually
+  // moves — rather than once a second — is most of what made the room feel
+  // sluggish with a full room bidding.
+  const undraftedRows = useMemo(
+    () => filteredUndrafted.map((p) => {
+      const statRow = statsView !== 'projected' ? statsRowFor(p, statsView) : null;
+      const isQB = p.player_position === 'QB';
+      const isSkill = ['RB', 'WR', 'TE'].includes(p.player_position);
+      const positionFull = !canFitPosition(leagueRosterSpec, nominationRosterCounts, p.player_position);
+      return (
+        <tr key={p.sleeper_id} style={{ background: POSITION_ROW_TINT[p.player_position] || 'transparent' }}>
+          <td style={{ whiteSpace: 'nowrap' }}>{p.rank ?? '-'}</td>
+          <td
+            className={`pos-${p.player_position}-highlight`}
+            style={{ whiteSpace: 'nowrap', maxWidth: 110, overflow: 'hidden', textOverflow: 'ellipsis' }}
+            title={p.full_name}
+          >
+            {p.full_name}
+          </td>
+          <td style={{ color: NFL_TEAM_COLORS[p.team] || 'var(--color-text)', fontWeight: 'bold' }}>{p.team}</td>
+          <td>{p.player_position}</td>
+          <td>{isQB && statRow ? statOrDash(statRow.passing_yards) : '—'}</td>
+          <td>{isQB && statRow ? statOrDash(statRow.passing_tds) : '—'}</td>
+          <td>{isQB && statRow ? statOrDash(statRow.interceptions) : '—'}</td>
+          <td>{statRow ? statOrDash(statRow.rushing_yards) : '—'}</td>
+          <td>{statRow ? statOrDash(statRow.rushing_tds) : '—'}</td>
+          <td>{isSkill && statRow ? statOrDash(statRow.receptions) : '—'}</td>
+          <td>{isSkill && statRow ? statOrDash(statRow.receiving_yards) : '—'}</td>
+          <td>{isSkill && statRow ? statOrDash(statRow.receiving_tds) : '—'}</td>
+          <td>{statRow ? Number(statRow.ppg).toFixed(1) : '—'}</td>
+          <td>${(salaryCap * (Number(p.cap_percent) || 0) / 100).toFixed(2)}</td>
+          <td style={{ textAlign: 'right' }}>
+            <button
+              disabled={!canNominate || positionFull}
+              onClick={() => nominatePlayer(p)}
+              className={canNominate && !positionFull ? 'bid-flash' : ''}
+              title={positionFull ? positionBlockedReason(leagueRosterSpec, nominationRosterCounts, p.player_position) : undefined}
+              style={{
+                padding: '2px 10px',
+                fontSize: '0.8rem',
+                borderRadius: '10px',
+                fontWeight: 'bold',
+                background: positionFull ? 'var(--color-button-bg)' : '#fff',
+                color: positionFull ? 'var(--color-text-muted)' : '#111',
+                cursor: canNominate && !positionFull ? 'pointer' : 'not-allowed',
+              }}
+            >
+              {positionFull ? 'Full' : 'Bid'}
+            </button>
+          </td>
+        </tr>
+      );
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filteredUndrafted, session, wonPlayers, statsView, seasonStats2025, seasonStats2024, salaryCap, leagueRosterSpec]
+  );
+
+  // The very first weekly auction, held back until NFL week 1 is in the books.
+  // With a Monday-night finish on 14 Sep 2026 that lands on Tue the 15th, Wed
+  // the 16th or Thu the 17th, whichever the league picked.
+  const firstRecurringAuction = (week1EndsAt && weeklyAuctionDay && weeklyAuctionTime)
+    ? getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, week1EndsAt)
+    : null;
+
+  function nextRecurringAuction(fromMs) {
+    if (!weeklyAuctionDay || !weeklyAuctionTime) return null;
+    const candidate = getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, new Date(fromMs));
+    if (firstRecurringAuction && candidate.getTime() < firstRecurringAuction.getTime()) {
+      return firstRecurringAuction;
+    }
+    return candidate;
+  }
+
+  // How long the room stays on "the draft has ended" before flipping back to a
+  // countdown. draft_end_session stamps ended_at, so every browser agrees on
+  // when the half hour is up.
+  const draftEndedAt = session?.ended_at ? new Date(session.ended_at).getTime() : null;
+  const inPostDraftHold = phase === 'ended' && draftEndedAt !== null && tick - draftEndedAt < POST_DRAFT_HOLD_MS;
+  // Everything that isn't a live auction shows the countdown screen: a draft
+  // that hasn't kicked off yet, and one that ended more than half an hour ago.
+  const showCountdownScreen = !started || (phase === 'ended' && !inPostDraftHold);
 
   const auctionTarget = (() => {
     if (firstDraftSchedule && new Date(firstDraftSchedule).getTime() > tick) {
       return new Date(firstDraftSchedule);
     }
-    if (weeklyAuctionDay && weeklyAuctionTime) {
-      return getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, new Date(tick));
-    }
-    return null;
+    return nextRecurringAuction(tick);
   })();
 
   // Auto-start: the moment the scheduled kickoff passes (or immediately, for a
@@ -959,9 +1175,17 @@ useEffect(() => {
   // that default would restart a draft that is already underway. Throttled so a
   // failing start retries every 10s instead of firing once a second.
   useEffect(() => {
-    if (!session || session.phase !== 'pending') return;
+    if (!session) return;
+    // A finished draft is eligible again only once its half-hour wrap-up has
+    // passed, otherwise the room would restart the moment the last bid landed.
+    if (session.phase !== 'pending' && !(session.phase === 'ended' && !inPostDraftHold)) return;
     if (!scheduleLoaded || !draftPoolLoaded) return;
-    if (auctionTarget && auctionTarget.getTime() > tick) return;
+
+    // A league that never set a schedule still starts its *first* draft on
+    // sight, as it always has. Restarting a finished draft, though, only ever
+    // happens at a real scheduled time — otherwise the room would loop.
+    const targetPassed = auctionTarget ? auctionTarget.getTime() <= tick : session.phase === 'pending';
+    if (!targetPassed) return;
     if (tick < nextAutoStartAttemptRef.current) return;
     nextAutoStartAttemptRef.current = tick + AUTO_START_RETRY_MS;
     beginNominationRound();
@@ -1068,7 +1292,10 @@ useEffect(() => {
       )}
 
       {/* My Team box — top right */}
-      <div style={{
+      <div
+        className={rosterPanel.isFullscreen ? 'panel-fullscreen' : undefined}
+        {...rosterPanel.holdProps}
+        style={{
         width: '27.21%', background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
         position: 'absolute', top: '3%', bottom: '52%', right: '1.70%', padding: 14, boxSizing: 'border-box',
@@ -1172,13 +1399,16 @@ useEffect(() => {
       </div>
 
       {/* Auction / nomination board — top left */}
-      <div style={{
+      <div
+        className={boardPanel.isFullscreen ? 'panel-fullscreen' : undefined}
+        {...boardPanel.holdProps}
+        style={{
         width: '66.67%', background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
-        position: 'absolute', top: '3%', bottom: started ? '38%' : '61.5%', left: '1.70%', padding: 14, boxSizing: 'border-box',
+        position: 'absolute', top: '3%', bottom: showCountdownScreen ? '61.5%' : '38%', left: '1.70%', padding: 14, boxSizing: 'border-box',
         overflowY: 'auto',
       }}>
-        {!started ? (
+        {showCountdownScreen ? (
           <div style={{ textAlign: 'center', marginTop: 40 }}>
             <h2 style={{ margin: 0 }}>Draft Room</h2>
             {error && <div className="error-text" style={{ marginTop: 8 }}>{error}</div>}
@@ -1186,7 +1416,9 @@ useEffect(() => {
               <div className="muted-text" style={{ marginTop: 8 }}>Loading auction schedule...</div>
             ) : auctionTarget ? (
               <>
-                <div className="muted-text" style={{ marginTop: 12 }}>Auction begins in:</div>
+                <div className="muted-text" style={{ marginTop: 12 }}>
+                  {phase === 'ended' ? "Next week's auction begins in:" : 'Auction begins in:'}
+                </div>
                 <div className="draft-clock" style={{ fontSize: '2.2rem', color: 'var(--color-error)', marginTop: 8 }}>
                   {formatCountdown(auctionTarget.getTime() - tick)}
                 </div>
@@ -1232,6 +1464,12 @@ useEffect(() => {
         {phase === 'ended' && (
           <div style={{ textAlign: 'center', marginTop: 60 }}>
             <h2>The draft has ended</h2>
+            {draftEndedAt !== null && (
+              <div className="muted-text" style={{ marginTop: 8 }}>
+                {'This room turns back into the countdown to the next weekly auction in '}
+                {formatCountdown(draftEndedAt + POST_DRAFT_HOLD_MS - tick)}.
+              </div>
+            )}
             <button
               onClick={onBack}
               style={{
@@ -1332,6 +1570,10 @@ useEffect(() => {
               const secondsLeft = Math.max(0, Math.round((s.timerEndsAt - tick) / 1000));
               const sizing = getCardSizing(playersPerAuction);
               const projectedValue = salaryCap * (Number(s.player.cap_percent) || 0) / 100;
+              // No open slot for this position means the whole bid control is
+              // dead for me — leading on him already is the one exception.
+              const rosterFull = !isMyBid && !canBidOnPlayer(s.player, s.key);
+              const rosterFullReason = rosterFull ? bidBlockedReason(s.player, s.key) : undefined;
 
               if (s.completed) {
                 return (
@@ -1388,7 +1630,7 @@ useEffect(() => {
                           <span>$</span>
                           <input
                             type="number"
-                            disabled={isMyBid}
+                            disabled={isMyBid || rosterFull}
                             value={s.myBidAmount}
                             onChange={(e) => {
                               const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
@@ -1401,7 +1643,7 @@ useEffect(() => {
                           <span>/</span>
                           <input
                             type="number"
-                            disabled={isMyBid}
+                            disabled={isMyBid || rosterFull}
                             value={s.myWeeks}
                             onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
                             style={{ width: 44 }}
@@ -1410,11 +1652,12 @@ useEffect(() => {
                         </div>
 
                         <button
-                          disabled={!(Number(s.myBidAmount) > s.highBid)}
+                          disabled={rosterFull || !(Number(s.myBidAmount) > s.highBid)}
                           onClick={() => submitBid(s.key)}
+                          title={rosterFullReason}
                           style={{ marginTop: 10, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
                         >
-                          {isMyBid ? 'Leading' : 'Submit Bid'}
+                          {isMyBid ? 'Leading' : rosterFull ? 'No Roster Slot' : 'Submit Bid'}
                         </button>
 
                     <div className="draft-clock" style={{ marginTop: 8, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
@@ -1600,7 +1843,7 @@ useEffect(() => {
                     <span>$</span>
                     <input
                       type="number"
-                      disabled={isMyBid}
+                      disabled={isMyBid || rosterFull}
                       value={s.myBidAmount}
                       onChange={(e) => {
                         const capMax = Math.max(0, salaryCap - committedAtWeek(currentWeek, s.key));
@@ -1613,7 +1856,7 @@ useEffect(() => {
                     <span>/</span>
                     <input
                       type="number"
-                      disabled={isMyBid}
+                      disabled={isMyBid || rosterFull}
                       value={s.myWeeks}
                       onChange={(e) => updateSlotWeeks(s.key, e.target.value)}
                       style={{ width: 36, padding: '2px 4px' }}
@@ -1622,11 +1865,12 @@ useEffect(() => {
                   </div>
 
                   <button
-                    disabled={!(Number(s.myBidAmount) > s.highBid)}
+                    disabled={rosterFull || !(Number(s.myBidAmount) > s.highBid)}
                     onClick={() => submitBid(s.key)}
+                    title={rosterFullReason}
                     style={{ marginTop: 8, width: '100%', background: isMyBid ? 'var(--color-success)' : 'var(--color-button-bg)', color: isMyBid ? '#111' : 'var(--color-text)', border: '3px solid white' }}
                   >
-                    {isMyBid ? 'Leading' : 'Submit Bid'}
+                    {isMyBid ? 'Leading' : rosterFull ? 'No Roster Slot' : 'Submit Bid'}
                   </button>
 
             <div className="draft-clock" style={{ marginTop: 6, fontSize: sizing.statSize, color: secondsLeft <= 20 ? 'var(--color-error)' : '#fff', background: s.flashUntil && tick < s.flashUntil ? '#e6c458' : 'transparent' }}>{formatMMSS(secondsLeft)}</div>
@@ -1640,7 +1884,10 @@ useEffect(() => {
       </div>
 
       {/* Pie chart grid — bottom right */}
-      <div style={{
+      <div
+        className={piePanel.isFullscreen ? 'panel-fullscreen' : undefined}
+        {...piePanel.holdProps}
+        style={{
         width: '27.21%', background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
         position: 'absolute', top: '50%', bottom: '3%', right: '1.70%', padding: 10, boxSizing: 'border-box',
@@ -1657,6 +1904,9 @@ useEffect(() => {
             return (
               <div
                 key={week}
+                // Its own 600ms hold hides the week, so the panel-level
+                // hold-to-fullscreen gesture must not also start here.
+                data-no-fullscreen
                 style={{ textAlign: 'center', userSelect: 'none' }}
                 onMouseDown={() => startHoldToHide(week)}
                 onMouseUp={cancelHold}
@@ -1724,10 +1974,13 @@ useEffect(() => {
       </div>
 
       {/* Undrafted players — bottom left */}
-      <div style={{
+      <div
+        className={poolPanel.isFullscreen ? 'panel-fullscreen' : undefined}
+        {...poolPanel.holdProps}
+        style={{
         width: '66.67%', background: 'var(--color-bg-panel)',
         border: '1px solid var(--color-border-subtle)', borderRadius: 8,
-        position: 'absolute', top: started ? '63.5%' : '40%', bottom: '3%', left: '1.70%', padding: 14, boxSizing: 'border-box',
+        position: 'absolute', top: showCountdownScreen ? '40%' : '63.5%', bottom: '3%', left: '1.70%', padding: 14, boxSizing: 'border-box',
         overflowY: 'auto',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
@@ -1796,55 +2049,7 @@ useEffect(() => {
               <th></th>
             </tr>
           </thead>
-          <tbody>
-            {filteredUndrafted.map((p) => {
-              const statRow = statsView !== 'projected' ? statsRowFor(p, statsView) : null;
-              const isQB = p.player_position === 'QB';
-              const isSkill = ['RB', 'WR', 'TE'].includes(p.player_position);
-              return (
-                <tr key={p.sleeper_id} style={{ background: POSITION_ROW_TINT[p.player_position] || 'transparent' }}>
-                  <td style={{ whiteSpace: 'nowrap' }}>{p.rank ?? '-'}</td>
-                  <td
-                    className={`pos-${p.player_position}-highlight`}
-                    style={{ whiteSpace: 'nowrap', maxWidth: 110, overflow: 'hidden', textOverflow: 'ellipsis' }}
-                    title={p.full_name}
-                  >
-                    {p.full_name}
-                  </td>
-                  <td style={{ color: NFL_TEAM_COLORS[p.team] || 'var(--color-text)', fontWeight: 'bold' }}>{p.team}</td>
-                  <td>{p.player_position}</td>
-                  <td>{isQB && statRow ? statOrDash(statRow.passing_yards) : '—'}</td>
-                  <td>{isQB && statRow ? statOrDash(statRow.passing_tds) : '—'}</td>
-                  <td>{isQB && statRow ? statOrDash(statRow.interceptions) : '—'}</td>
-                  <td>{statRow ? statOrDash(statRow.rushing_yards) : '—'}</td>
-                  <td>{statRow ? statOrDash(statRow.rushing_tds) : '—'}</td>
-                  <td>{isSkill && statRow ? statOrDash(statRow.receptions) : '—'}</td>
-                  <td>{isSkill && statRow ? statOrDash(statRow.receiving_yards) : '—'}</td>
-                  <td>{isSkill && statRow ? statOrDash(statRow.receiving_tds) : '—'}</td>
-                  <td>{statRow ? Number(statRow.ppg).toFixed(1) : '—'}</td>
-                  <td>${(salaryCap * (Number(p.cap_percent) || 0) / 100).toFixed(2)}</td>
-                  <td style={{ textAlign: 'right' }}>
-                    <button
-                      disabled={!canNominate}
-                      onClick={() => nominatePlayer(p)}
-                      className={canNominate ? 'bid-flash' : ''}
-                      style={{
-                        padding: '2px 10px',
-                        fontSize: '0.8rem',
-                        borderRadius: '10px',
-                        fontWeight: 'bold',
-                        background: '#fff',
-                        color: '#111',
-                        cursor: canNominate ? 'pointer' : 'not-allowed',
-                      }}
-                    >
-                      Bid
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
+          <tbody>{undraftedRows}</tbody>
         </table>
         {statsView === 'projected' && (
           <div className="settings-note" style={{ marginTop: 6 }}>
