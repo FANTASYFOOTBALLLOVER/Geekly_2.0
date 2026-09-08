@@ -1,7 +1,31 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '../supabaseClient';
+import { canFitPosition, countByPosition } from '../draftControls';
+import { useHoldToFullscreen } from '../holdToFullscreen';
 import geeklyLogo from '../assets/final-logo-geekly.png';
+import { NFL_TEAM_COLORS } from '../constants/teamColors';
 const SHIELD_PATH = 'M50 8 Q40 14 30 20 Q20 26 12 15 Q2 20 5 45 Q8 90 50 118 Q92 90 95 45 Q98 20 88 15 Q80 26 70 20 Q60 14 50 8 Z';
+
+const MAX_TEAM_NAME_LENGTH = 20;
+const LAST_LEAGUE_KEY = 'geekly:lastLeagueId';
+
+const GENERAL_SETTINGS_COLUMNS =
+  'name, is_public, bonus_win_top_half, num_teams, relegation_tiers, season_weeks, promote_relegate_count, salary_cap, ir_voids_contract, relegation_enabled';
+const GENERAL_SETTINGS_FIELDS = [
+  'name', 'is_public', 'bonus_win_top_half', 'num_teams', 'relegation_tiers',
+  'season_weeks', 'promote_relegate_count', 'salary_cap', 'ir_voids_contract',
+];
+
+function fieldsThatDidNotStick(submitted, saved, fields) {
+  return fields.filter((f) => {
+    const want = submitted[f];
+    const got = saved[f];
+    if (typeof got === 'boolean' || typeof want === 'boolean') return Boolean(want) !== Boolean(got);
+    if (want === null || want === undefined || want === '') return false;
+    if (!Number.isNaN(Number(want)) && !Number.isNaN(Number(got))) return Number(want) !== Number(got);
+    return String(want) !== String(got);
+  });
+}
 
 function Crest({ pattern, color1, color2, size = 40, onClick, title, empty = false }) {
   const clipId = `shield-clip-${pattern}-${(color1 || '').replace('#', '')}-${(color2 || '').replace('#', '')}`;
@@ -56,27 +80,16 @@ function ProfileMenu({ onLogout, onChangeUsername, onChangePassword, onCustomize
 }
 
 const DEFAULT_TIER_COLORS = [
-  'var(--color-pos-rb)',   // gold
-  'var(--color-pos-wr)',   // silver
-  'var(--color-pos-te)',   // bronze
-  'var(--color-pos-qb)',   // platinum
+  'var(--color-pos-rb)', 'var(--color-pos-wr)', 'var(--color-pos-te)', 'var(--color-pos-qb)',
   '#fff', '#fff', '#fff', '#fff',
 ];
 
-const NFL_TEAM_COLORS = {
-  ARI: '#97233F', ATL: '#A71930', BAL: '#241773', BUF: '#00338D', CAR: '#0085CA',
-  CHI: '#0B162A', CIN: '#FB4F14', CLE: '#311D00', DAL: '#003594', DEN: '#FB4F14',
-  DET: '#0076B6', GB: '#203731', HOU: '#03202F', IND: '#002C5F', JAX: '#101820',
-  KC: '#E31837', LAC: '#0080C6', LAR: '#003594', LV: '#000000', MIA: '#008E97',
-  MIN: '#4F2683', NE: '#002244', NO: '#D3BC8D', NYG: '#0B2265', NYJ: '#125740',
-  PHI: '#004C54', PIT: '#FFB612', SEA: '#69BE28', SF: '#AA0000', TB: '#D50A0A',
-  TEN: '#4B92DB', WAS: '#5A1414',
-};
-
 const POSITION_SLOT_COLORS = {
   QB: 'var(--color-pos-qb)', RB: 'var(--color-pos-rb)', WR: 'var(--color-pos-wr)',
-  TE: 'var(--color-pos-te)', FLEX: '#8ab4ff', SFLEX: '#b48ee0',
+  TE: 'var(--color-pos-te)', FLEX: '#8ab4ff', SFLEX: '#b48ee0', BENCH: '#6b6b7a',
 };
+
+const SLOT_BADGE_LABEL = { BENCH: 'BE', SFLEX: 'SF', FLEX: 'FL' };
 
 function easternWallClockToUTCISOStringHelper(dateTimeLocalStr) {
   const [datePart, timePart] = dateTimeLocalStr.split('T');
@@ -169,7 +182,7 @@ function tierDisplayColor(tierNumber, tierColor) {
 function generateRoundRobinSchedule(numTeams, numWeeks) {
   const slots = [];
   for (let i = 1; i <= numTeams; i++) slots.push(i);
-  if (numTeams % 2 !== 0) slots.push(0); // 0 = bye
+  if (numTeams % 2 !== 0) slots.push(0);
 
   for (let i = slots.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -205,6 +218,472 @@ function generateRoundRobinSchedule(numTeams, numWeeks) {
   return schedule;
 }
 
+const FA_SEASON = 2026;
+const DEAD_CAP_RATE = 0.80;
+const FA_PAGE_SIZE = 60;
+
+function contractCostInWeek(contract, week) {
+  const weeksElapsed = week - contract.start_week;
+  return Number(contract.base_value) * (1 + weeksElapsed * Number(contract.interest_rate_applied || 0));
+}
+
+function deadCapSchedule(contract, week) {
+  const rows = [];
+  for (let w = week; w <= Number(contract.end_week); w++) {
+    rows.push({ week: w, cost: contractCostInWeek(contract, w) * DEAD_CAP_RATE });
+  }
+  return rows;
+}
+
+function FreeAgentBoard({ league, week, rosterSpec, onSigned }) {
+  const [freeAgents, setFreeAgents] = useState([]);
+  const [contracts, setContracts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [faError, setFaError] = useState('');
+  const [positionFilter, setPositionFilter] = useState('ALL');
+  const [search, setSearch] = useState('');
+  const [visible, setVisible] = useState(FA_PAGE_SIZE);
+  const [target, setTarget] = useState(null);
+  const [cutId, setCutId] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    if (!league) return;
+    setLoading(true);
+    const [{ data: fa, error: faErr }, { data: mine, error: mineErr }] = await Promise.all([
+      supabase.rpc('get_free_agents', { p_league_id: league.league_id, p_season: FA_SEASON }),
+      supabase.rpc('get_team_contracts', { p_team_id: league.team_id, p_season: FA_SEASON }),
+    ]);
+    setLoading(false);
+    if (faErr || mineErr) { setFaError((faErr || mineErr).message); return; }
+    setFaError('');
+    setFreeAgents(fa || []);
+    setContracts(mine || []);
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [league?.league_id]);
+
+  const positions = ['QB', 'RB', 'WR', 'TE'];
+  const filtered = freeAgents.filter((p) => {
+    const matchesPos = positionFilter === 'ALL' || p.player_position === positionFilter;
+    const matchesSearch = !search || p.full_name.toLowerCase().includes(search.toLowerCase());
+    return matchesPos && matchesSearch;
+  });
+
+  function cutMakesRoom(contract) {
+    if (!target) return false;
+    const remaining = contracts.filter((c) => c.signing_id !== contract.signing_id);
+    return canFitPosition(rosterSpec, countByPosition(remaining), target.player_position);
+  }
+
+  async function handleSign() {
+    if (!target || !cutId) return;
+    setBusy(true);
+    const { error } = await supabase.rpc('sign_free_agent', {
+      p_team_id: league.team_id,
+      p_sleeper_id: target.sleeper_id,
+      p_cut_signing_id: cutId,
+      p_week: week,
+      p_season: FA_SEASON,
+    });
+    setBusy(false);
+    if (error) { setFaError(error.message); return; }
+    setFaError('');
+    setTarget(null);
+    setCutId(null);
+    await load();
+    if (onSigned) onSigned();
+  }
+
+  const chosenCut = contracts.find((c) => c.signing_id === cutId) || null;
+  const deadRows = chosenCut ? deadCapSchedule(chosenCut, week) : [];
+  const deadTotal = deadRows.reduce((sum, r) => sum + r.cost, 0);
+
+  return (
+    <div style={{ marginTop: 24, borderTop: '1px solid var(--color-border-subtle)', paddingTop: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+        <strong style={{ marginRight: 4 }}>Add Players</strong>
+        <input
+          type="text"
+          placeholder="Search free agents..."
+          value={search}
+          onChange={(e) => { setSearch(e.target.value); setVisible(FA_PAGE_SIZE); }}
+          style={{ flex: '0 1 260px', borderRadius: 10 }}
+        />
+        <button
+          onClick={() => { setPositionFilter('ALL'); setVisible(FA_PAGE_SIZE); }}
+          title="All positions"
+          style={{
+            width: 32, height: 32, borderRadius: '50%', padding: 0, background: '#000',
+            border: positionFilter === 'ALL' ? '2px solid #ff1493' : '2px solid #fff',
+            color: '#fff', fontSize: '0.6rem', fontWeight: 'bold',
+          }}
+        >
+          ALL
+        </button>
+        {positions.map((pos) => (
+          <button
+            key={pos}
+            onClick={() => { setPositionFilter(pos); setVisible(FA_PAGE_SIZE); }}
+            title={pos}
+            style={{
+              width: 32, height: 32, borderRadius: '50%', padding: 0,
+              background: POSITION_SLOT_COLORS[pos],
+              border: positionFilter === pos ? '2px solid #ff1493' : '2px solid transparent',
+              color: '#111', fontSize: '0.65rem', fontWeight: 'bold',
+            }}
+          >
+            {pos}
+          </button>
+        ))}
+        <span className="muted-text" style={{ fontSize: '0.72rem', marginLeft: 'auto' }}>
+          One week, free — but you have to cut somebody and eat {Math.round(DEAD_CAP_RATE * 100)}% of their remaining weeks.
+        </span>
+      </div>
+
+      {faError && <div className="error-text" style={{ marginBottom: 8 }}>{faError}</div>}
+      {loading && <div className="muted-text">Loading free agents...</div>}
+      {!loading && filtered.length === 0 && (
+        <div className="muted-text">No free agents match that filter.</div>
+      )}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 8 }}>
+        {filtered.slice(0, visible).map((p) => (
+          <div
+            key={p.sleeper_id}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 10, padding: 8, minWidth: 0,
+              border: '1px solid var(--color-border-subtle)', borderRadius: 8,
+              background: 'var(--color-bg-input)',
+            }}
+          >
+            <img
+              src={`https://sleepercdn.com/content/nfl/players/${p.sleeper_id}.jpg`}
+              alt={p.full_name}
+              onError={(e) => { e.target.style.visibility = 'hidden'; }}
+              style={{ width: 40, height: 40, borderRadius: 6, objectFit: 'cover', background: 'var(--color-avatar-fallback)', flex: '0 0 auto' }}
+            />
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontWeight: 'bold', fontSize: '0.9rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {p.full_name}
+              </div>
+              <div style={{ fontSize: '0.72rem', fontWeight: 'bold', color: NFL_TEAM_COLORS[p.team] || 'var(--color-text-muted)' }}>
+                {p.player_position} – {p.team || 'FA'}
+              </div>
+            </div>
+            <span className="muted-text" style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
+              ${Number(p.dollar_value).toFixed(0)}
+            </span>
+            <button
+              onClick={() => { setTarget(p); setCutId(null); setFaError(''); }}
+              title={`Sign ${p.full_name} for week ${week}`}
+              style={{
+                width: 28, height: 28, borderRadius: '50%', padding: 0, flex: '0 0 auto',
+                background: 'var(--color-success)', color: '#111', border: 'none',
+                fontWeight: 'bold', fontSize: '1.1rem', lineHeight: 1,
+              }}
+            >
+              +
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {filtered.length > visible && (
+        <button
+          onClick={() => setVisible((v) => v + FA_PAGE_SIZE)}
+          style={{ marginTop: 10, background: 'none', border: 'none', color: 'var(--color-text-muted)', textDecoration: 'underline', padding: 0, cursor: 'pointer' }}
+        >
+          Show more ({filtered.length - visible} left)
+        </button>
+      )}
+
+      {target && (
+        <div
+          className="modal-overlay"
+          data-no-fullscreen
+          style={{ zIndex: 500 }}
+          onClick={() => setTarget(null)}
+        >
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0 }}>Sign {target.full_name} for week {week}</h3>
+            <p className="muted-text" style={{ marginTop: -6 }}>
+              A one-week deal at no cost. Pick the contract you're cutting to make room —
+              {' '}{Math.round(DEAD_CAP_RATE * 100)}% of every week it had left still counts against your cap.
+            </p>
+
+            <div style={{ maxHeight: 260, overflowY: 'auto', marginTop: 8 }}>
+              {contracts.length === 0 && <div className="muted-text">You have no contracts to cut.</div>}
+              {contracts.map((c) => {
+                const makesRoom = cutMakesRoom(c);
+                const total = deadCapSchedule(c, week).reduce((sum, r) => sum + r.cost, 0);
+                return (
+                  <label
+                    key={c.signing_id}
+                    style={{
+                      display: 'grid', gridTemplateColumns: '20px 1fr auto', gap: 8, alignItems: 'center',
+                      padding: '6px 4px', borderBottom: '1px solid var(--color-border-subtle)',
+                      opacity: makesRoom ? 1 : 0.45, cursor: makesRoom ? 'pointer' : 'not-allowed',
+                    }}
+                    title={makesRoom ? undefined : `Cutting ${c.full_name} still leaves nowhere to put a ${target.player_position}.`}
+                  >
+                    <input
+                      type="radio"
+                      name="cut-choice"
+                      disabled={!makesRoom}
+                      checked={cutId === c.signing_id}
+                      onChange={() => setCutId(c.signing_id)}
+                    />
+                    <span style={{ minWidth: 0 }}>
+                      <span style={{ fontWeight: 'bold' }}>{c.full_name}</span>{' '}
+                      <span className="muted-text" style={{ fontSize: '0.75rem' }}>
+                        {c.player_position} – {c.team} · wks {c.start_week}–{c.end_week}
+                      </span>
+                    </span>
+                    <span style={{ color: 'var(--color-error)', fontSize: '0.8rem', whiteSpace: 'nowrap' }}>
+                      dead ${total.toFixed(2)}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+
+            {chosenCut && (
+              <div style={{ marginTop: 12 }}>
+                <div className="scoring-subheading" style={{ marginTop: 0 }}>
+                  Dead cap from cutting {chosenCut.full_name}
+                </div>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', fontSize: '0.75rem' }}>
+                  {deadRows.map((r) => (
+                    <span key={r.week} className="muted-text">
+                      Wk {r.week}: <strong style={{ color: 'var(--color-error)' }}>${r.cost.toFixed(2)}</strong>
+                    </span>
+                  ))}
+                </div>
+                <div style={{ marginTop: 6, fontWeight: 'bold' }}>
+                  Total dead cap: <span style={{ color: 'var(--color-error)' }}>${deadTotal.toFixed(2)}</span>
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+              <button
+                disabled={!cutId || busy}
+                onClick={handleSign}
+                style={{ background: 'var(--color-success)', color: '#111', fontWeight: 'bold' }}
+              >
+                {busy ? 'Signing...' : `Cut & Sign`}
+              </button>
+              <button onClick={() => setTarget(null)}>Cancel</button>
+            </div>
+            {faError && <div className="error-text" style={{ marginTop: 8 }}>{faError}</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const STOCK_SEASON = 2026;
+const STOCK_ROTATE_MS = 10000;
+const STOCK_UP_COLOR = 'var(--color-success)';
+const STOCK_DOWN_COLOR = 'var(--color-error)';
+
+function StockSparkline({ series, color, height = 44 }) {
+  const [hoverIdx, setHoverIdx] = useState(null);
+  const points = (series || []).map((d) => Number(d.amount) || 0);
+  if (points.length < 2) return <div style={{ height }} />;
+
+  const width = 100;
+  const max = Math.max(...points);
+  const min = Math.min(...points);
+  const span = max - min || 1;
+  const step = width / (points.length - 1);
+  const coords = points.map((v, i) => [i * step, height - ((v - min) / span) * (height - 6) - 3]);
+  const line = coords.map(([x, y], i) => `${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`).join(' ');
+  const [lastX, lastY] = coords[coords.length - 1];
+  const hovered = hoverIdx !== null ? series[hoverIdx] : null;
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        style={{ width: '100%', height: '65%', display: 'block', cursor: 'crosshair' }}
+        onMouseMove={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          const ratio = (e.clientX - rect.left) / rect.width;
+          const idx = Math.max(0, Math.min(points.length - 1, Math.round(ratio * (points.length - 1))));
+          setHoverIdx(idx);
+        }}
+        onMouseLeave={() => setHoverIdx(null)}
+      >
+        <path d={`${line} L ${width} ${height} L 0 ${height} Z`} fill={color} opacity="0.16" />
+        <path d={line} fill="none" stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" />
+        <circle cx={lastX} cy={lastY} r="2.5" fill={color} />
+        {hoverIdx !== null && (
+          <>
+            <line x1={coords[hoverIdx][0]} y1="0" x2={coords[hoverIdx][0]} y2={height} stroke={color} strokeWidth="1" opacity="0.4" vectorEffect="non-scaling-stroke" />
+            <circle cx={coords[hoverIdx][0]} cy={coords[hoverIdx][1]} r=".65" fill="#fff" stroke={color} strokeWidth="1.5" />
+          </>
+        )}
+      </svg>
+      {hovered && (
+        <div
+          style={{
+            position: 'absolute', bottom: '100%', left: `${(hoverIdx / (points.length - 1)) * 100}%`,
+            transform: 'translateX(-50%)', marginBottom: 4, whiteSpace: 'nowrap',
+            background: 'var(--color-bg-input)', border: `1px solid ${color}`, borderRadius: 6,
+            padding: '4px 8px', fontSize: '0.7rem', pointerEvents: 'none', zIndex: 10,
+          }}
+        >
+          <div style={{ fontWeight: 'bold' }}>${Number(hovered.amount).toFixed(2)}</div>
+          <div className="muted-text">{new Date(hovered.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StockCard({ mover }) {
+  const up = mover.direction === 'up';
+  const color = up ? STOCK_UP_COLOR : STOCK_DOWN_COLOR;
+  return (
+    <div
+      style={{
+        border: `1px solid ${color}`, borderRadius: 8, padding: 8,
+        background: 'var(--color-bg-input)', display: 'flex', flexDirection: 'column',
+        gap: 4, minWidth: 0, overflow: 'hidden',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+        <img
+          src={`https://sleepercdn.com/content/nfl/players/${mover.sleeper_id}.jpg`}
+          alt={mover.full_name}
+          onError={(e) => { e.target.style.visibility = 'hidden'; }}
+          style={{ width: 34, height: 34, borderRadius: 6, objectFit: 'cover', background: 'var(--color-avatar-fallback)', flex: '0 0 auto' }}
+        />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontWeight: 'bold', fontSize: '0.85rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {mover.full_name}
+          </div>
+          <div style={{ fontSize: '0.7rem', color: NFL_TEAM_COLORS[mover.team] || 'var(--color-text-muted)', fontWeight: 'bold' }}>
+            {mover.player_position} – {mover.team || 'FA'}
+          </div>
+        </div>
+        <div style={{ color, fontWeight: 'bold', fontSize: '0.85rem', whiteSpace: 'nowrap' }}>
+          {up ? '▲' : '▼'} ${Math.abs(mover.delta_dollars).toFixed(2)}
+        </div>
+      </div>
+      <StockSparkline series={mover.series} color={color} />
+      <div className="muted-text" style={{ fontSize: '0.65rem' }}>
+        Now ${Number(mover.today_dollars).toFixed(2)} of your cap (was ${Number(mover.yesterday_dollars).toFixed(2)})
+      </div>
+    </div>
+  );
+}
+
+function PlayerStockBoard({ expanded, teamId }) {
+  const [movers, setMovers] = useState([]);
+  const [stockError, setStockError] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const [rotation, setRotation] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    supabase
+      .rpc('refresh_player_draft_stock', { p_season: STOCK_SEASON })
+      .then(() => supabase.rpc('get_player_stock_movers', {
+        p_season: STOCK_SEASON, p_team_id: teamId, p_limit: 10, p_history_days: 14,
+      }))
+      .then(({ data, error: moversErr }) => {
+        if (cancelled) return;
+        setLoaded(true);
+        if (moversErr) { setStockError(moversErr.message); return; }
+        setMovers(data || []);
+      });
+    return () => { cancelled = true; };
+  }, [teamId]);
+
+  const risers = movers.filter((m) => m.direction === 'up');
+  const fallers = movers.filter((m) => m.direction === 'down');
+  const rotates = !expanded && (risers.length + fallers.length) > 0;
+
+  useEffect(() => {
+    if (!rotates) return undefined;
+    const interval = setInterval(() => setRotation((r) => r + 1), STOCK_ROTATE_MS);
+    return () => clearInterval(interval);
+  }, [rotates]);
+
+  const combined = [...risers, ...fallers];
+  const shown = expanded ? combined : (combined.length > 0 ? [combined[rotation % combined.length]] : []);
+
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 8 }}>
+        <strong>Player Stock</strong>
+        <span className="muted-text" style={{ fontSize: '0.7rem' }}>
+          Signings across every league, this week vs last
+        </span>
+      </div>
+
+      {stockError && <div className="error-text" style={{ fontSize: '0.75rem' }}>{stockError}</div>}
+
+      {!stockError && loaded && shown.length === 0 && (
+        <div className="muted-text" style={{ fontSize: '0.8rem' }}>
+          No movement yet — stock starts moving once leagues begin signing players.
+        </div>
+      )}
+
+      {shown.length > 0 && (
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: expanded ? 'repeat(auto-fill, minmax(230px, 1fr))' : '1fr',
+          gap: 8,
+        }}>
+          {shown.map((m) => <StockCard key={`${m.direction}-${m.sleeper_id}`} mover={m} />)}
+        </div>
+      )}
+    </>
+  );
+}
+
+function StockTicker() {
+  const [rows, setRows] = useState([]);
+
+  useEffect(() => {
+    supabase.rpc('get_stock_ticker', { p_season: STOCK_SEASON }).then(({ data }) => {
+      if (data) setRows(data);
+    });
+  }, []);
+
+  if (rows.length === 0) return <div className="muted-text" style={{ fontSize: '0.8rem' }}>Loading stock ticker...</div>;
+
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 16px', alignItems: 'baseline' }}>
+      {rows.map((r) => {
+        const up = r.pct_change >= 0;
+        const color = up ? STOCK_UP_COLOR : STOCK_DOWN_COLOR;
+        return (
+          <span key={r.sleeper_id} style={{ fontSize: '0.85rem', whiteSpace: 'nowrap' }}>
+            <span style={{ fontWeight: 'bold', color: POSITION_SLOT_COLORS[r.player_position] || 'var(--color-text)' }}>
+              {r.stock_code}
+            </span>
+            {' '}
+            <span style={{ color, fontWeight: 'bold' }}>
+              ({Math.abs(r.pct_change).toFixed(1)}% {up ? '▲' : '▼'})
+            </span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+
 function ScoringRow({ label, abbr, value, touched, disabled, comingSoon, onChange, step = '0.01' }) {
   return (
     <div className="settings-row">
@@ -227,7 +706,7 @@ function ScoringRow({ label, abbr, value, touched, disabled, comingSoon, onChang
 export default function Home({ profile, onLogout, onNavigate }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [tooltip, setTooltip] = useState(null);
-  const [mobileActiveTab, setMobileActiveTab] = useState('home'); // 'home' | 'rankings' | 'q3' | 'q4' — mobile-only, ignored on desktop
+  const [mobileActiveTab, setMobileActiveTab] = useState('home');
   const [editingUsername, setEditingUsername] = useState(false);
   const [editingPassword, setEditingPassword] = useState(false);
   const [newUsername, setNewUsername] = useState('');
@@ -269,6 +748,7 @@ export default function Home({ profile, onLogout, onNavigate }) {
   };
   const [generalSettings, setGeneralSettings] = useState(null);
   const [generalMsg, setGeneralMsg] = useState('');
+  const [leagueExitConfirm, setLeagueExitConfirm] = useState(null);
   const [originalNumTeams, setOriginalNumTeams] = useState(null);
   const [scoringSettings, setScoringSettings] = useState(null);
   const [scoringTouched, setScoringTouched] = useState({});
@@ -295,8 +775,16 @@ export default function Home({ profile, onLogout, onNavigate }) {
   const [relegationMsg, setRelegationMsg] = useState('');
   const [relegationTouched, setRelegationTouched] = useState({});
   const [confirmingShuffleAll, setConfirmingShuffleAll] = useState(false);
+  const [addingTeamToTier, setAddingTeamToTier] = useState(null);
+  const [addTeamSuccessTier, setAddTeamSuccessTier] = useState(null);
+  const [showSeasonSchedule, setShowSeasonSchedule] = useState(false);
+  const [seasonScheduleRows, setSeasonScheduleRows] = useState([]);
+  const [confirmingRelegationRun, setConfirmingRelegationRun] = useState(false);
+  const [relegationMoves, setRelegationMoves] = useState(null);
   const [myTierStandings, setMyTierStandings] = useState(null);
   const [teamSignings, setTeamSignings] = useState([]);
+  const [deadCapContracts, setDeadCapContracts] = useState([]);
+  const [rosterVersion, setRosterVersion] = useState(0);
   const [opponentTeam, setOpponentTeam] = useState(null);
   const [opponentSignings, setOpponentSignings] = useState([]);
   const [leagueRosterSpec, setLeagueRosterSpec] = useState(null);
@@ -310,6 +798,12 @@ export default function Home({ profile, onLogout, onNavigate }) {
   const [crestMsg, setCrestMsg] = useState('');
   const [showAuctionDropdown, setShowAuctionDropdown] = useState(false);
   const [tier1Cap, setTier1Cap] = useState(null);
+  const [draftPhase, setDraftPhase] = useState(null);
+  const [week1EndsAt, setWeek1EndsAt] = useState(null);
+
+  const teamPanel = useHoldToFullscreen();
+  const stockPanel = useHoldToFullscreen();
+  const q3Panel = useHoldToFullscreen();
 
   useEffect(() => {
     if (profile) {
@@ -331,10 +825,11 @@ export default function Home({ profile, onLogout, onNavigate }) {
     if (settingsSection !== 'General' || !activeLeague) return;
     supabase
       .from('leagues')
-      .select('name, is_public, bonus_win_top_half, num_teams, relegation_tiers, season_weeks, promote_relegate_count, salary_cap, ir_voids_contract')
+      .select(GENERAL_SETTINGS_COLUMNS)
       .eq('id', activeLeague.league_id)
       .single()
-      .then(({ data }) => {
+      .then(({ data, error: loadErr }) => {
+        if (loadErr) { setGeneralMsg(loadErr.message); return; }
         setGeneralSettings(data);
         setOriginalNumTeams(data ? data.num_teams : null);
       });
@@ -493,10 +988,36 @@ useEffect(() => {
     supabase.rpc('get_my_leagues').then(({ data }) => {
       if (data && data.length > 0) {
         setMyLeagues(data);
-        setActiveLeague(data[0]);
+        const remembered = Number(localStorage.getItem(LAST_LEAGUE_KEY));
+        setActiveLeague(data.find((l) => Number(l.league_id) === remembered) || data[0]);
       }
     });
   }, []);
+
+  useEffect(() => {
+    if (activeLeague) localStorage.setItem(LAST_LEAGUE_KEY, String(activeLeague.league_id));
+  }, [activeLeague]);
+
+  useEffect(() => {
+    if (!activeLeague) { setDraftPhase(null); return; }
+    let cancelled = false;
+    supabase
+      .from('draft_sessions')
+      .select('phase')
+      .eq('league_id', activeLeague.league_id)
+      .maybeSingle()
+      .then(({ data }) => { if (!cancelled) setDraftPhase(data ? data.phase : null); });
+
+    const channel = supabase
+      .channel(`home_draft_session_${activeLeague.league_id}`)
+      .on('postgres_changes', {
+        event: '*', schema: 'public', table: 'draft_sessions',
+        filter: `league_id=eq.${activeLeague.league_id}`,
+      }, (payload) => setDraftPhase(payload.new ? payload.new.phase : null))
+      .subscribe();
+
+    return () => { cancelled = true; supabase.removeChannel(channel); };
+  }, [activeLeague]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -506,13 +1027,11 @@ useEffect(() => {
       setJoinCode(inviteFromUrl);
       setJoinViaInviteLink(true);
       setShowJoinLeague(true);
-      // Clean the param out of the visible URL without losing the code (already saved above)
       params.delete('invite');
       const newUrl = window.location.pathname + (params.toString() ? `?${params.toString()}` : '');
       window.history.replaceState({}, '', newUrl);
       return;
     }
-    // Fallback: the code may have been captured before a signup/login redirect
     const pending = localStorage.getItem('pendingInviteCode');
     if (pending) {
       setJoinCode(pending);
@@ -520,20 +1039,6 @@ useEffect(() => {
       setShowJoinLeague(true);
     }
   }, []);
-
-  useEffect(() => {
-    if (!activeLeague) return;
-    supabase
-      .from('leagues')
-      .select('initial_draft_at, weekly_auction_day, weekly_auction_time')
-      .eq('id', activeLeague.league_id)
-      .single()
-      .then(({ data }) => {
-        setFirstDraftSchedule(data ? data.initial_draft_at : null);
-        setWeeklyAuctionDay(data ? data.weekly_auction_day : null);
-        setWeeklyAuctionTime(data ? data.weekly_auction_time : null);
-      });
-  }, [activeLeague]);
 
   useEffect(() => {
     if (!activeLeague) { setMyTierStandings(null); return; }
@@ -582,29 +1087,108 @@ useEffect(() => {
     if (!activeLeague) { setTeamSignings([]); setLeagueRosterSpec(null); return; }
     supabase
       .from('leagues')
-      .select('initial_draft_at, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, salary_cap')
+      .select('initial_draft_at, roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, salary_cap, promote_relegate_count, relegation_enabled, relegation_tiers, max_draft_qb, max_draft_rb, max_draft_wr, max_draft_te')
       .eq('id', activeLeague.league_id)
       .single()
       .then(({ data }) => {
-        setLeagueRosterSpec(data);
-        if (data) setCurrentLeagueWeek(getCurrentLeagueWeek(data.initial_draft_at, new Date(now)));
-      });
+  setLeagueRosterSpec(data);
+  if (data) setCurrentLeagueWeek(getCurrentLeagueWeek(data.initial_draft_at, new Date(now)));
+  setFirstDraftSchedule(data ? data.initial_draft_at : null);
+});
 
     supabase
       .rpc('get_team_active_signings', { p_team_id: activeLeague.team_id, p_season: 2026 })
       .then(({ data }) => setTeamSignings(data || []));
-  }, [activeLeague]);
+
+    supabase
+      .rpc('get_team_dead_cap', { p_team_id: activeLeague.team_id, p_season: 2026 })
+      .then(({ data, error: deadErr }) => {
+        if (deadErr) { console.error('get_team_dead_cap failed:', deadErr); return; }
+        setDeadCapContracts(data || []);
+      });
+  }, [activeLeague, rosterVersion]);
 
   useEffect(() => {
     const interval = setInterval(() => setNow(Date.now()), 60000);
     return () => clearInterval(interval);
   }, []);
 
-  async function openFullRankings() {
-    const { data } = await supabase.rpc('get_top_rankings', { p_limit: 1000 });
-    if (data) setFullRankings(data);
-    setShowFullRankings(true);
+  useEffect(() => {
+    supabase
+      .from('games')
+      .select('game_date')
+      .eq('season', 2026)
+      .eq('season_type', 'REG')
+      .eq('week', 1)
+      .order('game_date', { ascending: false })
+      .limit(1)
+      .then(({ data, error: gamesErr }) => {
+        if (gamesErr) { console.error('week 1 schedule fetch failed:', gamesErr); return; }
+        const lastGameDate = data && data[0] && data[0].game_date;
+        if (!lastGameDate) return;
+        setWeek1EndsAt(new Date(easternWallClockToUTCISOStringHelper(`${lastGameDate}T23:59`)));
+      });
+  }, []);
+
+  function nextRecurringAuction(fromMs) {
+    if (!weeklyAuctionDay || !weeklyAuctionTime) return null;
+    const candidate = getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, new Date(fromMs));
+    if (!candidate) return null;
+    const firstAllowed = week1EndsAt
+      ? getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, week1EndsAt)
+      : null;
+    if (firstAllowed && candidate.getTime() < firstAllowed.getTime()) return firstAllowed;
+    return candidate;
   }
+
+  async function openFullRankings() {
+  const { data } = await supabase.rpc('get_top_rankings', { p_limit: 1000 });
+  if (data) {
+    const [{ data: projRows }, { data: scoring }] = await Promise.all([
+      supabase.from('season_projections').select('*').eq('season', 2026),
+      supabase.rpc('get_scoring_settings', { p_league_id: activeLeague.league_id }),
+    ]);
+    const projBySleeperId = {};
+    (projRows || []).forEach((p) => { projBySleeperId[p.sleeper_id] = p; });
+
+    const merged = data.map((r) => {
+      const p = projBySleeperId[r.sleeper_id];
+      if (!p) return r;
+
+      const totalTDs = (Number(p.proj_rush_tds) || 0) + (Number(p.proj_rec_tds) || 0);
+
+      let totalPoints = 0;
+      if (scoring) {
+        totalPoints += (Number(p.proj_pass_yards) || 0) * Number(scoring.pass_yd || 0);
+        totalPoints += (Number(p.proj_pass_tds) || 0) * Number(scoring.pass_td || 0);
+        totalPoints += (Number(p.proj_interceptions) || 0) * Number(scoring.pass_int || 0);
+        totalPoints += (Number(p.proj_rush_yards) || 0) * Number(scoring.rush_yd || 0);
+        totalPoints += (Number(p.proj_rush_tds) || 0) * Number(scoring.rush_td || 0);
+        totalPoints += (Number(p.proj_receptions) || 0) * Number(scoring.reception || 0);
+        totalPoints += (Number(p.proj_rec_yards) || 0) * Number(scoring.rec_yd || 0);
+        totalPoints += (Number(p.proj_rec_tds) || 0) * Number(scoring.rec_td || 0);
+        if (r.player_position === 'TE') {
+          totalPoints += (Number(p.proj_receptions) || 0) * Number(scoring.te_bonus_per_reception || 0);
+        }
+      }
+      const projPPG = scoring ? totalPoints / 15 : null;
+
+      return {
+        ...r,
+        proj_receptions: p.proj_receptions,
+        proj_rec_yards: p.proj_rec_yards,
+        proj_rush_yards: p.proj_rush_yards,
+        proj_total_tds: totalTDs,
+        proj_pass_yards: p.proj_pass_yards,
+        proj_pass_tds: p.proj_pass_tds,
+        proj_interceptions: p.proj_interceptions,
+        proj_ppg: projPPG,
+      };
+    });
+    setFullRankings(merged);
+  }
+  setShowFullRankings(true);
+}
 
   function getNextRecurringAuctionDate(dayName, timeStr, fromDate) {
     const dayMap = { Sunday: 0, Monday: 1, Tuesday: 2, Wednesday: 3, Thursday: 4, Friday: 5, Saturday: 6 };
@@ -638,8 +1222,8 @@ function minutesUntilAuction() {
   let target = null;
   if (firstDraftSchedule && new Date(firstDraftSchedule).getTime() > now) {
     target = new Date(firstDraftSchedule);
-  } else if (weeklyAuctionDay && weeklyAuctionTime) {
-    target = getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, new Date(now));
+  } else {
+    target = nextRecurringAuction(now);
   }
   if (!target) return null;
   return (target.getTime() - now) / 60000;
@@ -649,8 +1233,8 @@ function minutesUntilAuction() {
 
     if (firstDraftSchedule && new Date(firstDraftSchedule).getTime() > now) {
       target = new Date(firstDraftSchedule);
-    } else if (weeklyAuctionDay && weeklyAuctionTime) {
-      target = getNextRecurringAuctionDate(weeklyAuctionDay, weeklyAuctionTime, new Date(now));
+    } else {
+      target = nextRecurringAuction(now);
     }
 
     if (target) {
@@ -704,15 +1288,32 @@ function minutesUntilAuction() {
     for (const s of teamSignings) {
       if (week >= s.start_week && week <= s.end_week) {
         const { cost } = contractCostAtWeek(s, week);
-        byPosition[s.player_position] = (byPosition[s.player_position] || 0) + cost;
+        if (!byPosition[s.player_position]) byPosition[s.player_position] = { value: 0, meta: [] };
+        byPosition[s.player_position].value += cost;
+        byPosition[s.player_position].meta.push({ name: s.full_name, cost });
         totalSpent += cost;
       }
     }
-    const segments = Object.entries(byPosition).map(([pos, val]) => ({
-      value: val,
+    const segments = Object.entries(byPosition).map(([pos, v]) => ({
+      value: v.value,
       color: POSITION_SLOT_COLORS[pos] || '#888',
-      meta: [{ name: pos, cost: val }],
+      meta: v.meta,
     }));
+    const deadMeta = [];
+    let deadTotal = 0;
+    for (const c of deadCapContracts) {
+      const from = Math.max(Number(c.cut_at_week) || 1, Number(c.start_week));
+      if (week < from || week > Number(c.end_week)) continue;
+      const cost = contractCostInWeek(c, week) * Number(c.dead_cap_pct ?? DEAD_CAP_RATE);
+      if (cost <= 0) continue;
+      deadMeta.push({ name: `${c.full_name} (dead)`, cost });
+      deadTotal += cost;
+    }
+    if (deadTotal > 0) {
+      segments.push({ value: deadTotal, color: 'var(--color-error)', meta: deadMeta });
+      totalSpent += deadTotal;
+    }
+
     const cap = leagueRosterSpec ? Number(leagueRosterSpec.salary_cap) : 300;
     const remaining = Math.max(0, cap - totalSpent);
     segments.push({ value: remaining, color: '#000', meta: [{ name: 'Cap Remaining', cost: remaining }] });
@@ -732,10 +1333,16 @@ function minutesUntilAuction() {
 
   async function handleSaveTeamIdentity() {
     setTeamIdentityMsg('');
+    const trimmedName = editTeamName.trim();
+    if (!trimmedName) { setTeamIdentityMsg('Team name cannot be empty.'); return; }
+    if (trimmedName.length > MAX_TEAM_NAME_LENGTH) {
+      setTeamIdentityMsg(`Team name must be ${MAX_TEAM_NAME_LENGTH} characters or fewer.`);
+      return;
+    }
     const { error } = await supabase.rpc('update_team_identity', {
       p_team_id: activeLeague.team_id,
-      p_team_name: editTeamName,
-      p_team_abbr: editTeamAbbr,
+      p_team_name: trimmedName,
+      p_team_abbr: editTeamAbbr.trim(),
     });
     if (error) { setTeamIdentityMsg(error.message); return; }
     setEditingTeamIdentity(false);
@@ -744,46 +1351,70 @@ function minutesUntilAuction() {
 
   async function handleSaveGeneralSettings() {
     setGeneralMsg('');
-    const { error } = await supabase.rpc('update_general_settings', {
-      p_league_id: activeLeague.league_id,
-      p_name: generalSettings.name,
-      p_is_public: generalSettings.is_public,
-      p_bonus_win_top_half: generalSettings.bonus_win_top_half,
-      p_num_teams: Number(generalSettings.num_teams),
-      p_relegation_tiers: Number(generalSettings.relegation_tiers),
-      p_season_weeks: Number(generalSettings.season_weeks),
-      p_promote_relegate_count: Number(generalSettings.promote_relegate_count),
-      p_salary_cap: Number(generalSettings.salary_cap),
-      p_ir_voids_contract: generalSettings.ir_voids_contract,
-    });
-    setGeneralMsg(error ? error.message : 'Saved.');
-    if (error) return;
+    const submitted = generalSettings;
+    const tierCount = Math.max(1, Number(submitted.relegation_tiers) || 1);
+    try {
+      const { error } = await supabase.rpc('update_general_settings', {
+        p_league_id: activeLeague.league_id,
+        p_name: submitted.name,
+        p_is_public: submitted.is_public,
+        p_bonus_win_top_half: submitted.bonus_win_top_half,
+        p_num_teams: Number(submitted.num_teams),
+        p_relegation_tiers: tierCount,
+        p_season_weeks: Number(submitted.season_weeks),
+        p_promote_relegate_count: Number(submitted.promote_relegate_count),
+        p_salary_cap: Number(submitted.salary_cap),
+        p_ir_voids_contract: submitted.ir_voids_contract,
+      });
+      if (error) { setGeneralMsg(error.message); return; }
 
-    if (Number(generalSettings.num_teams) !== Number(originalNumTeams)) {
-      const tierCountForResize = generalSettings.relegation_tiers > 1 ? Number(generalSettings.relegation_tiers) : 1;
-      for (let tier = 1; tier <= tierCountForResize; tier++) {
-        await supabase.rpc('resize_league_tier_teams', {
-          p_league_id: activeLeague.league_id,
-          p_tier_number: tier,
-          p_new_num_teams: Number(generalSettings.num_teams),
-        });
-        await supabase.rpc('clear_tier_schedule', {
-          p_league_id: activeLeague.league_id,
-          p_season: 2026,
-          p_tier_number: tier,
-        });
-        const schedule = generateRoundRobinSchedule(Number(generalSettings.num_teams), Number(generalSettings.season_weeks));
-        await supabase.rpc('insert_matchups_bulk', {
-          p_league_id: activeLeague.league_id,
-          p_season: 2026,
-          p_tier_number: tier,
-          p_matchups: schedule,
-        });
+      const { error: relErr } = await supabase.rpc('update_league_relegation_enabled', {
+        p_league_id: activeLeague.league_id,
+        p_enabled: tierCount > 1,
+      });
+      if (relErr) { setGeneralMsg(relErr.message); return; }
+
+      if (Number(submitted.num_teams) !== Number(originalNumTeams)) {
+        for (let tier = 1; tier <= tierCount; tier++) {
+          await supabase.rpc('resize_league_tier_teams', {
+            p_league_id: activeLeague.league_id,
+            p_tier_number: tier,
+            p_new_num_teams: Number(submitted.num_teams),
+          });
+          await supabase.rpc('clear_tier_schedule', {
+            p_league_id: activeLeague.league_id,
+            p_season: 2026,
+            p_tier_number: tier,
+          });
+          const schedule = generateRoundRobinSchedule(Number(submitted.num_teams), Number(submitted.season_weeks));
+          await supabase.rpc('insert_matchups_bulk', {
+            p_league_id: activeLeague.league_id,
+            p_season: 2026,
+            p_tier_number: tier,
+            p_matchups: schedule,
+          });
+        }
+        setOriginalNumTeams(Number(submitted.num_teams));
       }
-      setOriginalNumTeams(Number(generalSettings.num_teams));
-    }
 
-    refreshLeagues(activeLeague.league_id);
+      const { data: saved } = await supabase
+        .from('leagues')
+        .select(GENERAL_SETTINGS_COLUMNS)
+        .eq('id', activeLeague.league_id)
+        .single();
+      if (saved) {
+        setGeneralSettings(saved);
+        setOriginalNumTeams(saved.num_teams);
+        const stuck = fieldsThatDidNotStick(submitted, saved, GENERAL_SETTINGS_FIELDS);
+        setGeneralMsg(stuck.length === 0 ? 'Saved.' : `Saved, except: ${stuck.join(', ')} — the database rejected those values.`);
+      } else {
+        setGeneralMsg('Saved.');
+      }
+
+      refreshLeagues(activeLeague.league_id);
+    } catch (err) {
+      setGeneralMsg(err.message || String(err));
+    }
   }
 
   function updateScoringField(field, value) {
@@ -794,6 +1425,7 @@ function minutesUntilAuction() {
   async function handleSaveScoringSettings() {
     setScoringMsg('');
     const s = scoringSettings;
+    try {
     const { error } = await supabase.rpc('update_scoring_settings', {
       p_league_id: activeLeague.league_id,
       p_pass_yd: Number(s.pass_yd),
@@ -826,6 +1458,9 @@ function minutesUntilAuction() {
     });
     setScoringMsg(error ? error.message : 'Saved.');
     if (!error) refreshLeagues(activeLeague.league_id);
+    } catch (err) {
+      setScoringMsg(err.message || String(err));
+    }
   }
 
   function updateAuctionField(field, value) {
@@ -856,6 +1491,11 @@ function minutesUntilAuction() {
       return;
     }
 
+    const tierCaps = Array.isArray(s.tiers)
+      ? s.tiers.map((t) => ({ tier_number: t.tier_number, salary_cap: Number(t.salary_cap) }))
+      : [];
+
+    try {
     const { error } = await supabase.rpc('update_auction_settings', {
       p_league_id: activeLeague.league_id,
       p_initial_draft_at: easternWallClockToUTCISOString(s.initial_draft_at),
@@ -870,10 +1510,13 @@ function minutesUntilAuction() {
       p_max_long_term_contracts: Number(s.max_long_term_contracts),
       p_cap_rollover_pct: Number(s.cap_rollover_pct),
       p_allow_cap_trading: s.allow_cap_trading,
-      p_tier_caps: s.tiers.map((t) => ({ tier_number: t.tier_number, salary_cap: Number(t.salary_cap) })),
+      p_tier_caps: tierCaps,
     });
     setAuctionMsg(error ? error.message : 'Saved.');
     if (!error) refreshLeagues(activeLeague.league_id);
+    } catch (err) {
+      setAuctionMsg(err.message || String(err));
+    }
   }
 
   function updateRosterField(field, value) {
@@ -886,6 +1529,7 @@ function minutesUntilAuction() {
     const s = rosterSettings;
     const toIntOrNull = (v) => (v === '' || v === null || v === undefined ? null : Number(v));
 
+    try {
     const { error } = await supabase.rpc('update_roster_settings', {
       p_league_id: activeLeague.league_id,
       p_roster_qb: Number(s.roster_qb),
@@ -901,8 +1545,24 @@ function minutesUntilAuction() {
       p_max_draft_wr: toIntOrNull(s.max_draft_wr),
       p_max_draft_te: toIntOrNull(s.max_draft_te),
     });
-    setRosterMsg(error ? error.message : 'Saved.');
-    if (!error) refreshLeagues(activeLeague.league_id);
+    if (error) { setRosterMsg(error.message); return; }
+
+    const { data: saved } = await supabase
+      .from('leagues')
+      .select('roster_qb, roster_rb, roster_wr, roster_te, roster_flex, roster_superflex, roster_bench, roster_bye_slots, max_draft_qb, max_draft_rb, max_draft_wr, max_draft_te')
+      .eq('id', activeLeague.league_id)
+      .single();
+    if (saved) {
+      setRosterSettings(saved);
+      const stuck = fieldsThatDidNotStick(s, saved, Object.keys(saved));
+      setRosterMsg(stuck.length === 0 ? 'Saved.' : `Saved, except: ${stuck.join(', ')} — the database rejected those values.`);
+    } else {
+      setRosterMsg('Saved.');
+    }
+    refreshLeagues(activeLeague.league_id);
+    } catch (err) {
+      setRosterMsg(err.message || String(err));
+    }
   }
 
   function updateMatchupScoreLocal(matchupId, field, value) {
@@ -923,11 +1583,22 @@ function minutesUntilAuction() {
 
   async function handleSaveTierNamesColors() {
     setRelegationMsg('');
-    const { error } = await supabase.rpc('update_tier_names_colors', {
-      p_league_id: activeLeague.league_id,
-      p_tiers: relegationTiers.map((t) => ({ tier_number: t.tier_number, tier_name: t.tier_name, tier_color: t.tier_color, salary_cap: t.salary_cap })),
-    });
-    setRelegationMsg(error ? error.message : 'Saved.');
+    try {
+      const { error } = await supabase.rpc('update_tier_names_colors', {
+        p_league_id: activeLeague.league_id,
+        p_tiers: (relegationTiers || []).map((t) => ({
+          tier_number: t.tier_number, tier_name: t.tier_name,
+          tier_color: t.tier_color, salary_cap: Number(t.salary_cap),
+        })),
+      });
+      if (error) { setRelegationMsg(error.message); return; }
+      const { data } = await supabase.rpc('get_relegation_settings', { p_league_id: activeLeague.league_id });
+      setRelegationTiers(data || []);
+      setRelegationTouched({});
+      setRelegationMsg('Saved.');
+    } catch (err) {
+      setRelegationMsg(err.message || String(err));
+    }
   }
 
   async function handleShuffleAllTeams() {
@@ -964,6 +1635,23 @@ function minutesUntilAuction() {
     refreshMyTierStandings();
   }
 
+  async function handleRunRelegation() {
+    setRelegationMsg('');
+    setRelegationMoves(null);
+    const { data, error } = await supabase.rpc('apply_end_of_season_relegation', {
+      p_league_id: activeLeague.league_id,
+      p_season: 2026,
+    });
+    setConfirmingRelegationRun(false);
+    if (error) { setRelegationMsg(error.message); return; }
+
+    setRelegationMoves(data || []);
+    const { data: tiers } = await supabase.rpc('get_relegation_settings', { p_league_id: activeLeague.league_id });
+    setRelegationTiers(tiers || []);
+    setRelegationMsg((data || []).length === 0 ? 'No teams changed tier.' : 'Saved.');
+    refreshMyTierStandings();
+  }
+
   async function handleMoveTeamTier(teamId, direction) {
     setRelegationMsg('');
     const { error } = await supabase.rpc('move_team_tier', { p_team_id: teamId, p_direction: direction });
@@ -996,6 +1684,30 @@ function minutesUntilAuction() {
     setRelegationMsg('Saved.');
     refreshMyTierStandings();
   }
+
+   async function handleAddTeamToTier(tierNumber) {
+  setRelegationMsg('');
+  setAddingTeamToTier(null);
+  const { error } = await supabase.rpc('add_uncoached_team_to_tier', {
+    p_league_id: activeLeague.league_id,
+    p_tier_number: tierNumber,
+  });
+  if (error) { setRelegationMsg(error.message); return; }
+  const { data } = await supabase.rpc('get_relegation_settings', { p_league_id: activeLeague.league_id });
+  setRelegationTiers(data || []);
+  setAddTeamSuccessTier(tierNumber);
+  setTimeout(() => setAddTeamSuccessTier((current) => (current === tierNumber ? null : current)), 10000);
+}
+
+  useEffect(() => {
+    if (!showSeasonSchedule || !activeLeague?.team_id) return;
+    supabase
+      .rpc('get_my_season_schedule', { p_team_id: activeLeague.team_id, p_season: 2026 })
+      .then(({ data, error: schedErr }) => {
+        if (schedErr) { console.error('get_my_season_schedule failed:', schedErr); return; }
+        setSeasonScheduleRows(data || []);
+      });
+  }, [showSeasonSchedule, activeLeague]);
 
   async function refreshMyTierStandings() {
     const { data } = await supabase.rpc('get_my_tier_standings', { p_league_id: activeLeague.league_id, p_season: 2026 });
@@ -1122,16 +1834,49 @@ function minutesUntilAuction() {
     const { error } = await supabase.rpc('remove_team_user', { p_team_id: teamId });
     showLmMsg(error ? error.message : 'Saved.');
     setRemovingTeam(null);
-    if (!error) refreshLmTools();
+    if (!error) {
+      if (settingsSection === 'LM Tools') refreshLmTools();
+      if (settingsSection === 'Relegation' && activeLeague) {
+        const { data } = await supabase.rpc('get_relegation_settings', { p_league_id: activeLeague.league_id });
+        setRelegationTiers(data || []);
+      }
+    }
   }
 
-  async function handleRemoveSlot(teamId) {
-    setLmMsg('');
-    const { error } = await supabase.rpc('remove_team_slot', { p_team_id: teamId });
-    showLmMsg(error ? error.message : 'Saved.');
-    setRemovingTeam(null);
-    if (!error) refreshLmTools();
+  async function handleRemoveSlot(teamId, tierNumber) {
+  setLmMsg('');
+  const { error } = await supabase.rpc('remove_team_slot', { p_team_id: teamId });
+  showLmMsg(error ? error.message : 'Saved.');
+  setRemovingTeam(null);
+  if (error) return;
+
+  if (settingsSection === 'LM Tools') refreshLmTools();
+  if (settingsSection === 'Relegation' && activeLeague) {
+    const { data } = await supabase.rpc('get_relegation_settings', { p_league_id: activeLeague.league_id });
+    setRelegationTiers(data || []);
   }
+
+  if (tierNumber && activeLeague) {
+    const { data: leagueRow } = await supabase
+      .from('leagues')
+      .select('season_weeks')
+      .eq('id', activeLeague.league_id)
+      .single();
+    const { data: tierTeams } = await supabase.rpc('get_league_teams', {
+      p_league_id: activeLeague.league_id,
+      p_tier_number: tierNumber,
+    });
+    if (tierTeams && tierTeams.length >= 2) {
+      const schedule = generateRoundRobinSchedule(tierTeams.length, leagueRow.season_weeks);
+      await supabase.rpc('insert_matchups_bulk', {
+        p_league_id: activeLeague.league_id,
+        p_season: 2026,
+        p_tier_number: tierNumber,
+        p_matchups: schedule,
+      });
+    }
+  }
+}
 
   async function handleChangeUsername() {
     setAccountMsg('');
@@ -1153,11 +1898,39 @@ function minutesUntilAuction() {
 
   async function refreshLeagues(preferId) {
     const { data } = await supabase.rpc('get_my_leagues');
-    if (data) {
-      setMyLeagues(data);
-      setActiveLeague(data.find((l) => l.league_id === preferId) || data[0]);
-    }
+    const list = data || [];
+    setMyLeagues(list);
+    setActiveLeague(list.find((l) => l.league_id === preferId) || list[0] || null);
   }
+
+  async function handleLeaveLeague() {
+    setGeneralMsg('');
+    const { error } = await supabase.rpc('leave_league', { p_league_id: activeLeague.league_id });
+    if (error) { setLeagueExitConfirm(null); setGeneralMsg(error.message); return; }
+    localStorage.removeItem(LAST_LEAGUE_KEY);
+    setLeagueExitConfirm(null);
+    setShowLeagueSettings(false);
+    setSettingsSection(null);
+    refreshLeagues();
+  }
+
+  async function handleDeleteLeague() {
+    setGeneralMsg('');
+    const { error } = await supabase.rpc('delete_league', { p_league_id: activeLeague.league_id });
+    if (error) { setLeagueExitConfirm(null); setGeneralMsg(error.message); return; }
+    localStorage.removeItem(LAST_LEAGUE_KEY);
+    setLeagueExitConfirm(null);
+    setShowLeagueSettings(false);
+    setSettingsSection(null);
+    refreshLeagues();
+  }
+  async function handleWipeDraftResults() {
+  setGeneralMsg('');
+  const { error } = await supabase.rpc('wipe_draft_results', { p_league_id: activeLeague.league_id, p_season: 2026 });
+  setLeagueExitConfirm(null);
+  if (error) { setGeneralMsg(error.message); return; }
+  setGeneralMsg('Saved.');
+}
 
   async function handleCreateLeague() {
     setLeagueMsg('');
@@ -1230,6 +2003,15 @@ function minutesUntilAuction() {
     ? Number(newRelegationTiers) * Number(newNumTeams)
     : 0;
 
+  const promoteRelegateCount = Math.max(
+    1,
+    Number(leagueRosterSpec?.promote_relegate_count)
+      || Number(myTierStandings?.promote_count)
+      || 1
+  );
+
+  const draftIsLive = draftPhase !== null && draftPhase !== 'pending' && draftPhase !== 'ended';
+
   return (
     <div className="home-grid">
       {tooltip && (
@@ -1287,7 +2069,11 @@ function minutesUntilAuction() {
         </ul>
         <div className="muted-text" style={{ fontSize: '0.8rem', marginTop: 6 }}>*Click to Expand rankings</div>
       </div>
-      <div className={`quadrant quadrant-2 ${mobileActiveTab === 'home' ? 'mobile-active' : ''}`}>
+      <div
+        className={`quadrant quadrant-2 ${mobileActiveTab === 'home' ? 'mobile-active' : ''} ${teamPanel.isFullscreen ? 'panel-fullscreen' : ''}`}
+        {...teamPanel.holdProps}
+      >
+        {teamPanel.isFullscreen && <div className="fullscreen-hint">Hold 2.5s or press Esc to shrink</div>}
         {!activeLeague ? (
           <div style={{ position: 'relative' }}>
 
@@ -1311,7 +2097,7 @@ function minutesUntilAuction() {
                   onChange={(e) => setJoinCode(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && handleJoinLeague()}
                   style={{
-                    flex: '0 1 220px', fontSize: '1.2rem', textAlign: 'center',
+                    flex: '0 1 220px', fontSize: '1.1rem', textAlign: 'center',
                     padding: '16px 20px', letterSpacing: '2px',
                   }}
                 />
@@ -1324,7 +2110,7 @@ function minutesUntilAuction() {
           </div>
         ) : (
           <div>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-start' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <div style={{ position: 'relative' }}>
                   <button style={{ borderRadius: '16px' }} onClick={() => setShowLeagueSwitcher((v) => !v)}>
@@ -1365,18 +2151,18 @@ function minutesUntilAuction() {
               </div>
               {(() => {
   const minsLeft = minutesUntilAuction();
-  if (minsLeft !== null && minsLeft <= 60) {
+  if (draftIsLive || (minsLeft !== null && minsLeft <= 60)) {
     return (
       <button
         onClick={() => onNavigate('draft-room', activeLeague)}
-        style={{ background: 'var(--color-error)', color: '#fff', fontWeight: 'bold', fontSize: '1.1rem', padding: '10px 24px' }}
+        style={{ background: 'var(--color-error)', color: '#fff', fontWeight: 'bold', fontSize: '1.1rem', padding: '10px 24px', justifyContent: 'center', position: 'absolute', left: '50%' }}
       >
-        Enter Draft Room
+        {draftIsLive ? 'Enter Draft Room' : 'Enter Draft Room'}
       </button>
     );
   }
   return (
-    <span className="draft-clock" style={{ position: 'relative' }}>
+    <span className="draft-clock" style={{ position: 'relative', left: '16.4%' }}>
       <button className="auction-pill" onClick={() => setShowAuctionDropdown((v) => !v)}>Auction</button>
       {draftMessageSuffix()}
       {showAuctionDropdown && (
@@ -1391,19 +2177,7 @@ function minutesUntilAuction() {
     </span>
   );
 })()}
-              <button
-                style={{
-                  background: 'linear-gradient(135deg, #e6c458, #d4af37, #8a6d1f)',
-                  color: '#111',
-                  fontWeight: 'bold',
-                  borderRadius: '50px',
-                  padding: '10px 32px',
-                  border: 'none',
-                  boxShadow: '0 3px 10px rgba(212, 175, 55, 0.5)',
-                }}
-              >
-                Enter Lockerroom
-              </button>
+          
             </div>
 
             <div style={{ display: 'flex', gap: 20, marginTop: 16 }}>
@@ -1436,7 +2210,17 @@ function minutesUntilAuction() {
                     <span style={{ fontWeight: 'bold', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block', maxWidth: '100%' }}>{activeLeague.team_name}</span>
                   ) : (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <input type="text" value={editTeamName} onChange={(e) => setEditTeamName(e.target.value)} style={{ width: 110 }} />
+                      <input
+                        type="text"
+                        value={editTeamName}
+                        maxLength={MAX_TEAM_NAME_LENGTH}
+                        onChange={(e) => setEditTeamName(e.target.value)}
+                        title={`Up to ${MAX_TEAM_NAME_LENGTH} characters`}
+                        style={{ width: 110 }}
+                      />
+                      <span className="muted-text" style={{ fontSize: '0.7rem' }}>
+                        {editTeamName.length}/{MAX_TEAM_NAME_LENGTH}
+                      </span>
                       <input type="text" value={editTeamAbbr} maxLength={3} onChange={(e) => setEditTeamAbbr(e.target.value.toUpperCase())} style={{ width: 44, textAlign: 'center' }} />
                     </div>
                   )}
@@ -1471,20 +2255,17 @@ function minutesUntilAuction() {
                   {(() => {
                     const myRows = buildRosterSlotsFor(teamSignings);
                     const oppRows = buildRosterSlotsFor(opponentSignings);
-                    const rowCount = Math.min(Math.max(myRows.length, oppRows.length), 9);
+                    const rowCount = Math.max(myRows.length, oppRows.length);
 
-                    // Vertical-only sizing: stays full-size through 7 total roster
-                    // slots, shrinks a little at 8 and a little more at 9 — anything
-                    // beyond 9 is simply not rendered at all (rowCount above already
-                    // caps the loop there).
                     const totalSlots = leagueRosterSpec
                       ? (Number(leagueRosterSpec.roster_qb) || 0) + (Number(leagueRosterSpec.roster_rb) || 0)
                         + (Number(leagueRosterSpec.roster_wr) || 0) + (Number(leagueRosterSpec.roster_te) || 0)
                         + (Number(leagueRosterSpec.roster_flex) || 0) + (Number(leagueRosterSpec.roster_superflex) || 0)
                         + (Number(leagueRosterSpec.roster_bench) || 0)
                       : 0;
-                    const shrinkSteps = Math.max(0, Math.min(totalSlots, 9) - 7);
-                    const rowVerticalPadding = Math.max(5 - shrinkSteps * 1.5, 2);
+                    const shrinkSteps = Math.max(0, totalSlots - 7);
+                    const rowVerticalPadding = Math.max(5 - shrinkSteps * 1.5, 1);
+                    const rowFontSize = totalSlots > 11 ? '0.78rem' : '0.85rem';
 
                     return Array.from({ length: rowCount }, (_, i) => {
                       const mine = myRows[i];
@@ -1492,18 +2273,20 @@ function minutesUntilAuction() {
                       const myCost = mine?.player ? contractCostAtWeek(mine.player, currentLeagueWeek) : null;
                       const oppCost = opp?.player ? contractCostAtWeek(opp.player, currentLeagueWeek) : null;
                       const position = mine?.position || opp?.position;
+                      const benchRow = position === 'BENCH';
+                      const nameOpacity = benchRow ? 0.55 : 1;
                       return (
-                        <div key={i} style={{ display: 'grid', gridTemplateColumns: '8% 1fr 6% 7% 6% 1fr 8%', gap: 4, alignItems: 'center', padding: `${rowVerticalPadding}px 0`, borderBottom: '1px solid var(--color-border-subtle)', fontSize: '0.85rem' }}>
+                        <div key={i} style={{ display: 'grid', gridTemplateColumns: '8% 1fr 6% 7% 6% 1fr 8%', gap: 4, alignItems: 'center', padding: `${rowVerticalPadding}px 0`, borderBottom: '1px solid var(--color-border-subtle)', fontSize: rowFontSize }}>
                           <span className="muted-text" style={{ fontSize: '0.7rem' }}>
                             {mine?.player && myCost ? <>${myCost.cost.toFixed(0)}/{myCost.weeksRemaining}</> : ''}
                           </span>
-                          <span style={{ color: mine?.player ? (NFL_TEAM_COLORS[mine.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
+                          <span style={{ opacity: nameOpacity, color: mine?.player ? (NFL_TEAM_COLORS[mine.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
                             {mine?.player ? mine.player.full_name : '—'}
                           </span>
                           <span className="muted-text" style={{ textAlign: 'right', fontSize: '0.75rem' }}>—</span>
-                          <span className="roster-slot-badge" style={{ background: POSITION_SLOT_COLORS[position], textAlign: 'center', justifySelf: 'center' }}>{position}</span>
+                          <span className="roster-slot-badge" style={{ background: POSITION_SLOT_COLORS[position], textAlign: 'center', justifySelf: 'center' }}>{SLOT_BADGE_LABEL[position] || position}</span>
                           <span className="muted-text" style={{ fontSize: '0.75rem' }}>—</span>
-                          <span style={{ textAlign: 'right', color: opp?.player ? (NFL_TEAM_COLORS[opp.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
+                          <span style={{ opacity: nameOpacity, textAlign: 'right', color: opp?.player ? (NFL_TEAM_COLORS[opp.player.team] || 'var(--color-text)') : 'var(--color-text)' }}>
                             {opp?.player ? opp.player.full_name : '—'}
                           </span>
                           <span className="muted-text" style={{ textAlign: 'right', fontSize: '0.7rem' }}>
@@ -1521,27 +2304,42 @@ function minutesUntilAuction() {
                   </div>
                 </div>
 
-                <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-start', gap: 26 }}>
-                  {Array.from({ length: 6 }, (_, i) => currentLeagueWeek + i).map((week) => {
+                <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-start', gap: 26, alignItems: 'flex-end' }}>
+                  {Array.from({ length: 6 }, (_, i) => currentLeagueWeek + i).map((week, idx) => {
                     const slices = buildPieSlices(buildWeekCapSegments(week), 64);
                     return (
-                      <div key={week} style={{ textAlign: 'center' }}>
-                        <div className="muted-text" style={{ fontSize: '0.7rem', marginBottom: 2 }}>Week {week}</div>
-                        <svg width="64" height="64" viewBox="0 0 64 64">
-                          {slices.map((s, i) =>
-                            s.path
-                              ? <path
-                                  key={i} d={s.path} fill={s.color} stroke="var(--color-border)" strokeWidth="1"
-                                  onMouseEnter={(e) => s.meta && setTooltip({ x: e.clientX, y: e.clientY, meta: s.meta })}
-                                  onMouseLeave={() => setTooltip(null)}
-                                />
-                              : <circle
-                                  key={i} cx="32" cy="32" r="31" fill={s.color} stroke="var(--color-border)" strokeWidth="1"
-                                  onMouseEnter={(e) => s.meta && setTooltip({ x: e.clientX, y: e.clientY, meta: s.meta })}
-                                  onMouseLeave={() => setTooltip(null)}
-                                />
-                          )}
-                        </svg>
+                      <div key={week} style={{ textAlign: 'center', display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <div>
+                          <div className="muted-text" style={{ fontSize: '0.7rem', marginBottom: 2 }}>Week {week}</div>
+                          <svg width="64" height="64" viewBox="0 0 64 64">
+                            {slices.map((s, i) =>
+                              s.path
+                                ? <path
+                                    key={i} d={s.path} fill={s.color} stroke="var(--color-border)" strokeWidth="1"
+                                    onMouseEnter={(e) => s.meta && setTooltip({ x: e.clientX, y: e.clientY, meta: s.meta })}
+                                    onMouseLeave={() => setTooltip(null)}
+                                  />
+                                : <circle
+                                    key={i} cx="32" cy="32" r="31" fill={s.color} stroke="var(--color-border)" strokeWidth="1"
+                                    onMouseEnter={(e) => s.meta && setTooltip({ x: e.clientX, y: e.clientY, meta: s.meta })}
+                                    onMouseLeave={() => setTooltip(null)}
+                                  />
+                            )}
+                          </svg>
+                        </div>
+                        {idx === 5 && (
+                          <button
+                            onClick={() => setShowSeasonSchedule(true)}
+                            title="View full season schedule"
+                            style={{
+                              padding: '5px 12px', fontSize: '0.7rem', whiteSpace: 'nowrap',
+                              background: 'rgba(127, 126, 160, 0.62)', color: 'var(--color-text-muted)',
+                              border: 'none', borderRadius: 6,
+                            }}
+                          >
+                            View Schedule
+                          </button>
+                        )}
                       </div>
                     );
                   })}
@@ -1586,16 +2384,17 @@ function minutesUntilAuction() {
 
                           const inPromoZone = isTopTier
                             ? t.rank === 1
-                            : t.rank <= myTierStandings.promote_count;
-                          const inRelegationZone = !isBottomTier && t.rank > teamCount - myTierStandings.relegate_count;
+                            : t.rank <= promoteRelegateCount;
+                          const inRelegationZone = !isBottomTier && t.rank > teamCount - promoteRelegateCount;
 
                           let cellClass = '';
                           if (inPromoZone) {
-                            const nextTeam = myTierStandings.teams.find((x) => x.rank === myTierStandings.promote_count + 1);
+                            const cutoff = isTopTier ? 2 : promoteRelegateCount + 1;
+                            const nextTeam = myTierStandings.teams.find((x) => x.rank === cutoff);
                             const clinched = nextTeam ? t.min_possible_wins > nextTeam.max_possible_wins : true;
                             cellClass = clinched ? 'promo-solid' : 'promo-light';
                           } else if (inRelegationZone) {
-                            const prevTeam = myTierStandings.teams.find((x) => x.rank === teamCount - myTierStandings.relegate_count);
+                            const prevTeam = myTierStandings.teams.find((x) => x.rank === teamCount - promoteRelegateCount);
                             const clinched = prevTeam ? t.max_possible_wins < prevTeam.min_possible_wins : true;
                             cellClass = clinched ? 'releg-solid' : 'releg-light';
                           }
@@ -1626,19 +2425,40 @@ function minutesUntilAuction() {
                 )}
               </div>
             </div>
+
+            {teamPanel.isFullscreen && (
+              <FreeAgentBoard
+                league={activeLeague}
+                week={currentLeagueWeek}
+                rosterSpec={leagueRosterSpec}
+                onSigned={() => setRosterVersion((v) => v + 1)}
+              />
+            )}
           </div>
         )}
       </div>
       <div className="bottom-row">
-        <div className={`quadrant ${mobileActiveTab === 'q3' ? 'mobile-active' : ''}`}>Coming soon</div>
-        <div className={`quadrant ${mobileActiveTab === 'q4' ? 'mobile-active' : ''}`}>Coming soon</div>
+        <div
+          className={`quadrant ${mobileActiveTab === 'q3' ? 'mobile-active' : ''} ${q3Panel.isFullscreen ? 'panel-fullscreen' : ''}`}
+          {...q3Panel.holdProps}
+        >
+          {q3Panel.isFullscreen && <div className="fullscreen-hint">Hold 2.5s or press Esc to shrink</div>}
+          <StockTicker />
+        </div>
+        <div
+          className={`quadrant ${mobileActiveTab === 'q4' ? 'mobile-active' : ''} ${stockPanel.isFullscreen ? 'panel-fullscreen' : ''}`}
+          {...stockPanel.holdProps}
+        >
+          {stockPanel.isFullscreen && <div className="fullscreen-hint">Hold 2.5s or press Esc to shrink</div>}
+          <PlayerStockBoard expanded={stockPanel.isFullscreen} teamId={activeLeague?.team_id} />
+        </div>
       </div>
 
       <nav className="mobile-bottom-nav">
         <button className={mobileActiveTab === 'home' ? 'active' : ''} onClick={() => setMobileActiveTab('home')}>Home</button>
         <button className={mobileActiveTab === 'rankings' ? 'active' : ''} onClick={() => setMobileActiveTab('rankings')}>Rankings</button>
         <button className={mobileActiveTab === 'q3' ? 'active' : ''} onClick={() => setMobileActiveTab('q3')}>Coming Soon</button>
-        <button className={mobileActiveTab === 'q4' ? 'active' : ''} onClick={() => setMobileActiveTab('q4')}>Coming Soon</button>
+        <button className={mobileActiveTab === 'q4' ? 'active' : ''} onClick={() => setMobileActiveTab('q4')}>Stock</button>
       </nav>
 
       {showFullRankings && (
@@ -1652,13 +2472,14 @@ function minutesUntilAuction() {
                   <th>Player</th>
                   <th>Pos</th>
                   <th>Rec</th>
-                  <th>Yards</th>
-                  <th>TDs</th>
+                  <th>Rec Yards</th>
+                  <th>Rush Yards</th>
+                  <th>Tot TDs</th>
                   <th>Pass Yds</th>
                   <th>Pass TDs</th>
                   <th>INTs</th>
-                  <th>Proj PPG</th>
-                  <th>%</th>
+                  <th>PPG</th>
+                  <th>Proj. Value</th>
                 </tr>
               </thead>
               <tbody>
@@ -1667,14 +2488,15 @@ function minutesUntilAuction() {
                     <td>{r.rank ?? '-'}</td>
                     <td className={`pos-${r.player_position}-highlight`}>{r.full_name}</td>
                     <td>{r.player_position}</td>
-                    <td></td>
-                    <td></td>
-                    <td></td>
-                    <td></td>
-                    <td></td>
-                    <td></td>
-                    <td></td>
-                    <td>{tier1Cap !== null ? `$${capDollarValue(r.cap_percent)}` : `${r.cap_percent}%`}</td>
+                   <td>{r.proj_receptions != null ? Math.round(r.proj_receptions) : '—'}</td>
+<td>{r.proj_rec_yards != null ? Math.round(r.proj_rec_yards) : '—'}</td>
+<td>{r.proj_rush_yards != null ? Math.round(r.proj_rush_yards) : '—'}</td>
+<td>{r.proj_total_tds != null ? r.proj_total_tds.toFixed(1) : '—'}</td>
+<td>{r.proj_pass_yards != null ? Math.round(r.proj_pass_yards) : '—'}</td>
+<td>{r.proj_pass_tds != null ? r.proj_pass_tds.toFixed(1) : '—'}</td>
+<td>{r.proj_interceptions != null ? r.proj_interceptions.toFixed(1) : '—'}</td>
+<td>{r.proj_ppg != null ? r.proj_ppg.toFixed(1) : '—'}</td>
+<td>{tier1Cap !== null ? `$${capDollarValue(r.cap_percent)}` : `${r.cap_percent}%`}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1876,8 +2698,39 @@ function minutesUntilAuction() {
             </p>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
               <button onClick={() => handleRemoveUser(removingTeam.team_id)}>Remove User</button>
-              <button onClick={() => handleRemoveSlot(removingTeam.team_id)} style={{ background: 'var(--color-error)', color: '#111' }}>Remove Team Slot</button>
+              <button onClick={() => handleRemoveSlot(removingTeam.team_id, removingTeam.tier_number)}>Remove Team Slot</button>
               <button onClick={() => setRemovingTeam(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showSeasonSchedule && (
+        <div className="modal-overlay" onClick={() => setShowSeasonSchedule(false)}>
+          <div className="modal-box modal-box-narrow" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ textAlign: 'center' }}>Season Schedule</h3>
+            {seasonScheduleRows.length === 0 ? (
+              <div className="muted-text" style={{ textAlign: 'center', marginTop: 10 }}>No schedule found.</div>
+            ) : (
+              <table className="rankings-table" style={{ marginTop: 10 }}>
+                <thead>
+                  <tr>
+                    <th>Week</th>
+                    <th>Opponent</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {seasonScheduleRows.map((row) => (
+                    <tr key={row.week} style={row.week === currentLeagueWeek ? { fontWeight: 'bold' } : undefined}>
+                      <td>{row.week}</td>
+                      <td>{row.opponent_name || 'Bye'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div style={{ marginTop: 16, textAlign: 'center' }}>
+              <button onClick={() => setShowSeasonSchedule(false)}>Close</button>
             </div>
           </div>
         </div>
@@ -1930,7 +2783,7 @@ function minutesUntilAuction() {
         </div>
       )}
 
-      {showLeagueSettings && (
+      {showLeagueSettings && activeLeague && (
         <div className="modal-overlay" onClick={() => { setShowLeagueSettings(false); setSettingsSection(null); }}>
           <div className="modal-box modal-box-settings" onClick={(e) => e.stopPropagation()}>
             <h3 style={{ textAlign: 'center', fontFamily: 'Georgia', fontSize: '1.8rem' }}>{activeLeague.league_name} Settings</h3>
@@ -2104,7 +2957,63 @@ function minutesUntilAuction() {
                   )}
                   <button onClick={() => { setShowLeagueSettings(false); setSettingsSection(null); }}>Close</button>
                 </div>
-                {generalMsg && <div className="success-text" style={{ marginTop: 8 }}>{generalMsg}</div>}
+
+                <div className="scoring-subheading" style={{ marginTop: 24 }}>Danger Zone</div>
+                <div className="settings-note" style={{ marginBottom: 10 }}>
+                  {activeLeague.is_owner
+                    ? 'Leaving hands the league to another member. Deleting removes the league, its teams and every contract in it, for everyone. Neither can be undone.'
+                    : 'Leaving gives up your team and every contract on it. This cannot be undone.'}
+                </div>
+                {leagueExitConfirm === null ? (
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button onClick={() => { setGeneralMsg(''); setLeagueExitConfirm('leave'); }}>
+                      Leave League
+                    </button>
+                    {activeLeague.is_owner && (
+                      <button
+                        style={{ background: 'var(--color-error)', color: '#111', fontWeight: 'bold' }}
+                        onClick={() => { setGeneralMsg(''); setLeagueExitConfirm('delete'); }}
+                      >
+                        Delete League
+                      </button>
+                    )}
+                    {activeLeague.is_owner && (
+                      <button
+                        style={{ background: 'var(--color-error)', color: '#111', fontWeight: 'bold' }}
+                        onClick={() => { setGeneralMsg(''); setLeagueExitConfirm('wipe'); }}
+                      >
+                        Wipe Draft Results
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span className="error-text" style={{ fontSize: '0.85rem' }}>
+                      {leagueExitConfirm === 'delete'
+                        ? `Permanently delete ${activeLeague.league_name}?`
+                        : leagueExitConfirm === 'wipe'
+                        ? `Remove every player from every team in ${activeLeague.league_name} and allow a new draft to be scheduled?`
+                        : `Leave ${activeLeague.league_name}?`}
+                    </span>
+                    <button
+                      style={{ background: 'var(--color-error)', color: '#111', fontWeight: 'bold' }}
+                      onClick={
+                        leagueExitConfirm === 'delete' ? handleDeleteLeague
+                        : leagueExitConfirm === 'wipe' ? handleWipeDraftResults
+                        : handleLeaveLeague
+                      }
+                    >
+                      Yes, {leagueExitConfirm === 'delete' ? 'delete it' : leagueExitConfirm === 'wipe' ? 'wipe it' : 'leave'}
+                    </button>
+                    <button onClick={() => setLeagueExitConfirm(null)}>Cancel</button>
+                  </div>
+                )}
+
+                {generalMsg && (
+                  <div className={generalMsg === 'Saved.' ? 'success-text' : 'error-text'} style={{ marginTop: 8 }}>
+                    {generalMsg}
+                  </div>
+                )}
               </div>
             )}
 
@@ -2172,7 +3081,7 @@ function minutesUntilAuction() {
             disabled={!activeLeague.is_owner}
             value={initialDraftDate ?? ''}
             onChange={(e) => setInitialDraftDateTime(e.target.value, initialDraftTime)}
-            style={{ width: 150, color: auctionTouched.initial_draft_at ? 'var(--color-text)' : 'var(--color-text-muted)' }}
+            style={{ width: 150, color: auctionTouched.initial_draft_at ? 'var(--color-text)' : 'var(--color-white)' }}
           />
         <select
   disabled={!activeLeague.is_owner}
@@ -2430,9 +3339,10 @@ function minutesUntilAuction() {
                   </div>
                 ))}
                 {lmSchedule.length > 0 && (
-                  <button onClick={() => setShowFullSchedule(!showFullSchedule)}                    style={{ background: 'none', border: 'none', color: 'var(--color-text-muted)', textDecoration: 'underline', padding: 0, cursor: 'pointer' }}
->
-                    
+                  <button
+                    onClick={() => setShowFullSchedule(!showFullSchedule)}
+                    style={{ background: 'none', border: 'none', color: 'var(--color-text-muted)', textDecoration: 'underline', padding: 0, cursor: 'pointer' }}
+                  >
                     {showFullSchedule ? 'Show Just Week 1' : 'View Rest of Schedule'}
                   </button>
                 )}
@@ -2470,7 +3380,7 @@ function minutesUntilAuction() {
                     {lmStandings.map((s) => (
                       <tr key={s.team_id}>
                         <td>
-                          <svg width="18" height="18" viewBox="0 0 24 24" style={{ cursor: 'pointer' }} onClick={() => setRemovingTeam(s)}>
+                          <svg width="18" height="18" viewBox="0 0 24 24" style={{ cursor: 'pointer' }} onClick={() => setRemovingTeam({ ...s, tier_number: scheduleTier })}>
                             <circle cx="12" cy="12" r="10" fill="none" stroke="var(--color-error)" strokeWidth="2" />
                             <line x1="5" y1="19" x2="19" y2="5" stroke="var(--color-error)" strokeWidth="2" />
                           </svg>
@@ -2595,9 +3505,47 @@ function minutesUntilAuction() {
                 {relegationTiers.map((t) => (
                   <div key={t.tier_number} style={{ marginBottom: 12 }}>
 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-  <span style={{ fontWeight: 'bold', color: t.tier_color || 'var(--color-text)' }}>
+  <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+    <span style={{ fontWeight: 'bold', color: t.tier_color || 'var(--color-text)' }}>
     {t.tier_name || `Tier ${t.tier_number}`}
   </span>
+  <span style={{ fontWeight: 'bold', color: t.tier_color || 'var(--color-text)' }}>
+    ({(t.teams || []).length})
+  </span>
+  {activeLeague.is_owner && (
+    addingTeamToTier === t.tier_number ? (
+      <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span className="error-text" style={{ fontSize: '0.72rem' }}>
+          This will reshuffle the schedule.
+        </span>
+        <button
+          onClick={() => handleAddTeamToTier(t.tier_number)}
+          style={{ background: 'var(--color-success)', color: '#111', fontSize: '0.72rem', padding: '2px 10px' }}
+        >
+          Create Team
+        </button>
+        <button onClick={() => setAddingTeamToTier(null)} style={{ fontSize: '0.72rem', padding: '2px 10px' }}>
+          Cancel
+        </button>
+      </span>
+    ) : (
+      <button
+        onClick={() => setAddingTeamToTier(t.tier_number)}
+        title={`Add a team to ${t.tier_name || `Tier ${t.tier_number}`}`}
+        style={{
+          width: 20, height: 20, borderRadius: '50%', padding: 0,
+          background: 'var(--color-success)', color: '#111', border: 'none',
+          fontWeight: 'bold', fontSize: '0.9rem', lineHeight: 1,
+        }}
+      >
+        +
+      </button>
+    )
+  )}
+  {addTeamSuccessTier === t.tier_number && (
+    <span className="success-text" style={{ fontSize: '0.72rem' }}>Team created</span>
+  )}
+</span>
   {t.tier_number === 1 && activeLeague.is_owner && (
     !confirmingShuffleAll ? (
       <button style={{ color: 'var(--color-success)' }} onClick={() => setConfirmingShuffleAll(true)}>
@@ -2617,7 +3565,17 @@ function minutesUntilAuction() {
                       {(t.teams || []).map((team) => (
                         <li key={team.team_id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                           <span>{team.team_name}</span>
-                          <span style={{ display: 'flex', gap: 4 }}>
+                          <span style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                            {activeLeague.is_owner && (
+                              <svg
+                                width="18" height="18" viewBox="0 0 24 24" style={{ cursor: 'pointer' }}
+                                onClick={() => setRemovingTeam({ ...team, tier_number: t.tier_number })}
+                                title={`Remove ${team.team_name}`}
+                              >
+                                <circle cx="12" cy="12" r="10" fill="var(--color-error)" />
+                                <line x1="6" y1="12" x2="18" y2="12" stroke="#fff" strokeWidth="2.5" />
+                              </svg>
+                            )}
                             <button
                               disabled={!activeLeague.is_owner || t.tier_number === 1}
                               onClick={() => handleMoveTeamTier(team.team_id, 'up')}
@@ -2634,6 +3592,39 @@ function minutesUntilAuction() {
                     </ul>
                   </div>
                 ))}
+
+                {activeLeague.is_owner && relegationTiers.length > 1 && (
+                  <div style={{ marginTop: 18, paddingTop: 14, borderTop: '1px solid var(--color-border-subtle)' }}>
+                    <div className="scoring-subheading" style={{ marginTop: 0 }}>End of Season</div>
+                    <div className="settings-note" style={{ marginBottom: 10 }}>
+                      Promotes the top {promoteRelegateCount} and relegates the bottom {promoteRelegateCount} of every
+                      tier, using the final standings. Run this once, after the last week has been scored.
+                    </div>
+                    {!confirmingRelegationRun ? (
+                      <button style={{ color: 'var(--color-success)' }} onClick={() => setConfirmingRelegationRun(true)}>
+                        Run Promotion &amp; Relegation
+                      </button>
+                    ) : (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span className="error-text" style={{ fontSize: '0.8rem' }}>This moves teams for real. Are you sure?</span>
+                        <button style={{ background: 'var(--color-success)', color: '#111' }} onClick={handleRunRelegation}>Yes</button>
+                        <button onClick={() => setConfirmingRelegationRun(false)}>Cancel</button>
+                      </div>
+                    )}
+                    {relegationMoves && relegationMoves.length > 0 && (
+                      <ul className="rankings-list">
+                        {relegationMoves.map((m) => (
+                          <li key={m.team_id} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                            <span>{m.team_name}</span>
+                            <span className={m.movement === 'promoted' ? 'promo-solid' : 'releg-solid'}>
+                              Tier {m.from_tier} → {m.to_tier}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
 
                 {relegationMsg && (
                   <div className={relegationMsg === 'Saved.' ? 'success-text' : 'error-text'} style={{ marginTop: 8 }}>

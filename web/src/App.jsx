@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { supabase } from './supabaseClient';
 import Landing from './pages/Landing';
 import SignUp from './pages/SignUp';
@@ -15,6 +15,12 @@ export default function App() {
   const [checkingSession, setCheckingSession] = useState(true);
   const [draftLeagueContext, setDraftLeagueContext] = useState(null);
 
+  // Who we already consider signed in. supabase-js re-emits SIGNED_IN for the
+  // same user on routine session recovery (notably every time the tab becomes
+  // visible again), so the user id — not the event name — is what tells a real
+  // new sign-in apart from background upkeep.
+  const signedInUserIdRef = useRef(null);
+
   async function fetchProfile(session) {
     if (!session) return null;
     const { data: profileRow } = await supabase
@@ -27,11 +33,13 @@ export default function App() {
 
   async function loadProfileAndRouteInitial(session) {
     if (!session) {
+      signedInUserIdRef.current = null;
       setProfile(null);
       setView('landing');
       return;
     }
 
+    signedInUserIdRef.current = session.user.id;
     const profileRow = await fetchProfile(session);
     setProfile(profileRow);
 
@@ -73,11 +81,16 @@ export default function App() {
         return;
       }
       if (_event === 'SIGNED_OUT') {
+        signedInUserIdRef.current = null;
         setProfile(null);
         setView('landing');
         return;
       }
-      if (_event === 'SIGNED_IN' && session) {
+      // SIGNED_IN fires both for a real login and for routine session recovery
+      // — including every time the tab regains visibility. Only a session for
+      // someone we weren't already signed in as is a real login worth routing on.
+      if (_event === 'SIGNED_IN' && session && session.user.id !== signedInUserIdRef.current) {
+        signedInUserIdRef.current = session.user.id;
         fetchProfile(session).then((profileRow) => {
           setProfile(profileRow);
           if (!profileRow || !profileRow.username) {
@@ -88,12 +101,13 @@ export default function App() {
         });
         return;
       }
-      // Any other event (TOKEN_REFRESHED, INITIAL_SESSION, USER_UPDATED, etc.)
-      // is routine background upkeep, not a real sign-in — never change the
-      // current view for these, so switching tabs or sitting idle for a
-      // while never yanks someone out of wherever they currently are,
-      // mid-draft included.
+      // Everything else (a re-emitted SIGNED_IN for the same user, plus
+      // TOKEN_REFRESHED, INITIAL_SESSION, USER_UPDATED, etc.) is routine
+      // background upkeep, not a real sign-in — never change the current view
+      // for these, so switching tabs or sitting idle for a while never yanks
+      // someone out of wherever they currently are, mid-draft included.
       if (session) {
+        signedInUserIdRef.current = session.user.id;
         fetchProfile(session).then((profileRow) => setProfile(profileRow));
       }
     });

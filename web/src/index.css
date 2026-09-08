@@ -28,6 +28,8 @@ body {
   color: var(--color-text);
 }
 
+
+
 button {
   cursor: pointer;
   font-size: 1rem;
@@ -207,6 +209,9 @@ select {
   letter-spacing: -0.06em;
   color: #f3f3f3;
 }
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+}
 
 .landing-copy p {
   margin: 0;
@@ -368,7 +373,7 @@ select {
   grid-template-columns: .75fr 3.25fr;
   grid-template-rows: auto 1.75fr 1.25fr;
   gap: 28px;
-  padding: 24px;
+  padding: 12px 24px 12px 24px;
   height: 100vh;
 }
 
@@ -381,7 +386,7 @@ select {
 }
 
 .quadrant-1 { grid-column: 1; grid-row: 2; }
-.quadrant-2 { grid-column: 2; grid-row: 1 / 3;}
+.quadrant-2 { grid-column: 2; grid-row: 1 / 3; }
 
 .quadrant {
   border: 1px solid var(--color-border-subtle);
@@ -390,6 +395,8 @@ select {
   overflow-y: auto;
   background: var(--color-bg-panel);
 }
+
+.quadrant-2 { padding-bottom: 2px; }
 
 @media (max-width: 800px) {
   .home-grid {
@@ -740,7 +747,7 @@ select {
   font-weight: bold;
   border: none;
   border-radius: 10px;
-  padding: 0px 4px;
+  padding: 12px 16px;
   font-size: 1.1rem;
   cursor: pointer;
 }
@@ -815,4 +822,39 @@ select {
     font-weight: bold;
     border-top: 2px solid var(--color-success);
   }
+}
+/* --- Hold-to-fullscreen panels ------------------------------------------
+   Press and hold for 2.5s anywhere in a panel to expand it over the whole
+   window; hold again or press Escape to shrink it back. Replaces the old
+   fullscreen button entirely — there is no chrome for this. */
+.panel-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  top: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  width: auto !important;
+  height: auto !important;
+  max-width: none !important;
+  max-height: none !important;
+  margin: 0 !important;
+  border-radius: 0 !important;
+  z-index: 400;
+  overflow-y: auto;
+  background: var(--color-bg-panel);
+}
+
+.fullscreen-hint {
+  position: fixed;
+  top: 10px;
+  right: 14px;
+  z-index: 401;
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+  background: var(--color-bg-input);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 999px;
+  padding: 3px 10px;
+  pointer-events: none;
 }
