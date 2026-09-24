@@ -835,7 +835,7 @@ useEffect(() => {
 // render can color it differently (green text, no dollar cost yet).
 const pendingPicks = (slots || [])
   .filter((s) => !s.completed && Number(s.highBidderTeamId) === Number(teamId))
-  .map((s) => ({ player: s.player, pending: true }));
+  .map((s) => ({ player: s.player, pending: true, highBid: Number(s.highBid) }));
 const pendingByPosition = { QB: [], RB: [], WR: [], TE: [] };
 pendingPicks.forEach((w) => { if (pendingByPosition[w.player.player_position]) pendingByPosition[w.player.player_position].push(w); });
     teamPicks.forEach((w) => { if (byPosition[w.player.player_position]) byPosition[w.player.player_position].push(w); });
@@ -872,10 +872,14 @@ if (['QB', 'RB', 'WR', 'TE'].includes(pos)) {
   }
 
   function totalSpentByTeam(teamId) {
-    return allWonPlayers
-      .filter((w) => Number(w.teamId) === Number(teamId))
-      .reduce((sum, w) => sum + costAtWeekWithBye(w.baseValue, w.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[w.player.team]), 0);
-  }
+  const wonTotal = allWonPlayers
+    .filter((w) => Number(w.teamId) === Number(teamId))
+    .reduce((sum, w) => sum + costAtWeekWithBye(w.baseValue, w.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[w.player.team]), 0);
+  const pendingTotal = (slots || [])
+    .filter((s) => !s.completed && Number(s.highBidderTeamId) === Number(teamId))
+    .reduce((sum, s) => sum + Number(s.highBid), 0);
+  return wonTotal + pendingTotal;
+}
 
   function buildWeekSegments(weekNumber) {
     const byPosition = {};
@@ -1424,7 +1428,9 @@ if (['QB', 'RB', 'WR', 'TE'].includes(pos)) {
             <span className="muted-text" style={{ fontSize: '0.7rem' }}>Cost</span>
           </div>
           {buildRosterSlotsForTeam(viewingTeamId ?? league?.team_id).map((slot, i) => {
-            const cost = slot.won && !slot.pending ? costAtWeekWithBye(slot.won.baseValue, slot.won.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[slot.won.player.team]) : null;
+            const cost = slot.won
+  ? (slot.pending ? slot.won.highBid : costAtWeekWithBye(slot.won.baseValue, slot.won.startWeek, currentWeek, interestRatePerWeek, byeWeeksByTeam[slot.won.player.team]))
+  : null;
             return (
               <div key={i} style={{ display: 'grid', gridTemplateColumns: '45px 1fr 55px', gap: 4, alignItems: 'center', padding: '4px 0', borderBottom: '1px solid var(--color-border-subtle)' }}>
                 <span className="roster-slot-badge" style={{ background: POSITION_COLORS[slot.position] || '#8ab4ff' }}>{slot.position}</span>

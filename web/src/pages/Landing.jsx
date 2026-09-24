@@ -1,6 +1,201 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import geeklyLogo from '../assets/final-logo-geekly.png';
 import { supabase } from '../supabaseClient';
+import { NFL_TEAM_COLORS } from '../constants/teamColors';
+
+const STOCK_SEASON = 2026;
+const STOCK_SORTS = [
+  ['value', 'Overall value'],
+  ['position', 'Position'],
+  ['team', 'Team'],
+  ['name', 'Name'],
+  ['risers', 'Biggest risers'],
+  ['fallers', 'Biggest fallers'],
+];
+const STOCK_POSITION_COLORS = { QB: 'var(--color-pos-qb)', RB: 'var(--color-pos-rb)', WR: 'var(--color-pos-wr)', TE: 'var(--color-pos-te)' };
+
+function normalPlaceholder(seed) {
+  let first = Math.sin(seed * 12.9898) * 43758.5453;
+  let second = Math.sin((seed + 17) * 78.233) * 43758.5453;
+  first -= Math.floor(first);
+  second -= Math.floor(second);
+  const normal = Math.sqrt(-2 * Math.log(Math.max(first, 0.0001))) * Math.cos(2 * Math.PI * second);
+  return Math.max(-45, Math.min(45, normal * 15));
+}
+
+function movementPercent(player, index) {
+  const tickerChange = Number(player.pct_change);
+  if (Number.isFinite(tickerChange) && tickerChange !== 0) return tickerChange;
+  const today = Number(player.today_dollars);
+  const lastWeek = Number(player.yesterday_dollars);
+  if (lastWeek > 0 && today > 0 && today !== lastWeek) return ((today / lastWeek) - 1) * 100;
+  return normalPlaceholder(index + String(player.stock_code || '').length);
+}
+
+function isPlaceholderMovement(player) {
+  return !(Number.isFinite(Number(player.pct_change)) && Number(player.pct_change) !== 0)
+    && !(Number(player.yesterday_dollars) > 0 && Number(player.today_dollars) > 0 && Number(player.today_dollars) !== Number(player.yesterday_dollars));
+}
+
+function StockHistoryGraph({ series }) {
+  const values = (series || []).map((point) => Number(point.amount) || 0);
+  if (values.length < 2) return <div className="stock-detail-no-chart">No price history yet</div>;
+  const min = Math.min(...values);
+  const span = Math.max(...values) - min || 1;
+  const points = values.map((value, index) => `${(index / (values.length - 1)) * 100},${34 - ((value - min) / span) * 28}`).join(' ');
+  return (
+    <svg className="stock-detail-graph" viewBox="0 0 100 40" preserveAspectRatio="none">
+      <polyline points={points} fill="none" stroke="var(--color-pos-rb)" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+function PlayerStockModal({ player, stats, games, onClose }) {
+  const teamColor = NFL_TEAM_COLORS[player.team] || 'var(--color-text)';
+  const seasonsWithStats = [...new Set((stats || []).map((row) => Number(row.season)))].filter((season) => season >= 2021 && season <= STOCK_SEASON);
+  const firstSeason = Math.min(...seasonsWithStats, STOCK_SEASON);
+  const [season, setSeason] = useState(STOCK_SEASON);
+  const seasonStats = (stats || []).filter((row) => Number(row.season) === season);
+  const seasonTeams = [...new Set(seasonStats.map((row) => row.team).filter(Boolean))];
+  const teams = season === STOCK_SEASON ? [...new Set([player.team, ...seasonTeams].filter(Boolean))] : seasonTeams;
+  const schedule = (games || []).filter((game) => Number(game.season) === season && teams.includes(game.home_team) || Number(game.season) === season && teams.includes(game.away_team)).sort((a, b) => a.week - b.week);
+  const statByWeek = Object.fromEntries(seasonStats.map((row) => [row.week, row]));
+  const value = (row, field) => row ? (row[field] ?? 0) : '-';
+  return (
+    <div className="modal-overlay stock-player-overlay" onClick={onClose}>
+      <div className="stock-player-modal" onClick={(event) => event.stopPropagation()}>
+        <button className="stock-player-close" onClick={onClose} aria-label="Close player details">×</button>
+        <div className="stock-player-header">
+          <img src={`https://sleepercdn.com/content/nfl/players/${player.sleeper_id}.jpg`} alt="" onError={(event) => { event.currentTarget.style.visibility = 'hidden'; }} />
+          <div>
+            <h3 style={{ color: teamColor }}>{player.full_name || player.stock_code}</h3>
+            <div style={{ color: teamColor }}>{player.team || 'FA'} · {player.player_position || player.position || '—'}</div>
+            <strong style={{ color: STOCK_POSITION_COLORS[player.player_position] || 'var(--color-text)' }}>{player.stock_code}</strong>
+          </div>
+        </div>
+        <div className="stock-season-picker">
+          <select value={season} onChange={(event) => setSeason(Number(event.target.value))}>
+            {Array.from({ length: STOCK_SEASON - 2021 + 1 }, (_, index) => STOCK_SEASON - index).map((year) => (
+              <option key={year} value={year} disabled={year < firstSeason}>{year}</option>
+            ))}
+          </select>
+        </div>
+        <StockHistoryGraph series={player.series} />
+        <div className="stock-player-stats">
+          <table><thead><tr><th>Wk</th><th>Opponent</th><th>Cmp</th><th>Att</th><th>Pass Yds</th><th>Pass TD</th><th>INT</th><th>Rush Att</th><th>Rush Yds</th><th>Rush TD</th><th>Targets</th><th>Rec</th><th>Rec Yds</th><th>Rec TD</th><th>Total Yds</th><th>Total TD</th><th>Fum</th></tr></thead>
+            <tbody>{Array.from({ length: 18 }, (_, index) => index + 1).map((week) => {
+              const row = statByWeek[week];
+              const game = schedule.find((item) => Number(item.week) === week);
+              const opponent = game ? (teams.includes(game.home_team) ? game.away_team : game.home_team) : (row?.opponent_team || '—');
+              const isQuarterback = player.player_position === 'QB';
+              const totalYards = isQuarterback ? '—' : Number(row?.rushing_yards || 0) + Number(row?.receiving_yards || 0);
+              const totalTds = isQuarterback ? '—' : Number(row?.rushing_tds || 0) + Number(row?.receiving_tds || 0);
+              return <tr key={week}><td>{week}</td><td>{opponent}</td><td>{value(row, 'completions')}</td><td>{value(row, 'attempts')}</td><td>{value(row, 'passing_yards')}</td><td>{value(row, 'passing_tds')}</td><td>{value(row, 'interceptions')}</td><td>{value(row, 'rushing_attempts')}</td><td>{value(row, 'rushing_yards')}</td><td>{value(row, 'rushing_tds')}</td><td>{value(row, 'targets')}</td><td>{value(row, 'receptions')}</td><td>{value(row, 'receiving_yards')}</td><td>{value(row, 'receiving_tds')}</td><td>{totalYards}</td><td>{totalTds}</td><td>{value(row, 'fumbles_lost')}</td></tr>;
+            })}</tbody></table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LandingStockExchange() {
+  const [players, setPlayers] = useState([]);
+  const [stockError, setStockError] = useState('');
+  const [sort, setSort] = useState('value');
+  const [selectedPlayer, setSelectedPlayer] = useState(null);
+  const [playerStats, setPlayerStats] = useState({});
+  const [playerGames, setPlayerGames] = useState({});
+
+  function openPlayer(player) {
+    setSelectedPlayer(player);
+    if (playerStats[player.sleeper_id]) return;
+    Promise.all([
+      supabase.from('weekly_stats')
+      .select('season, week, team, opponent_team, passing_yards, passing_tds, rushing_yards, rushing_tds, receiving_yards, receiving_tds, receptions, completions, attempts, interceptions, rushing_attempts, targets, fumbles_lost')
+      .eq('sleeper_id', player.sleeper_id).in('season', [2021, 2022, 2023, 2024, 2025, STOCK_SEASON]).order('season', { ascending: true }).order('week', { ascending: true }),
+      supabase.from('games').select('season, week, home_team, away_team').gte('season', 2021).lte('season', STOCK_SEASON).eq('season_type', 'REG'),
+    ]).then(([{ data: stats }, { data: games }]) => {
+      setPlayerStats((current) => ({ ...current, [player.sleeper_id]: stats || [] }));
+      setPlayerGames((current) => ({ ...current, [player.sleeper_id]: games || [] }));
+    });
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadStock() {
+      const { data: ticker, error: tickerError } = await supabase
+        .rpc('get_stock_ticker', { p_season: STOCK_SEASON });
+      if (!tickerError && ticker?.length) {
+        if (!cancelled) {
+          setStockError('');
+          setPlayers(ticker.filter((player) => player.stock_code));
+        }
+        return;
+      }
+
+      const { data: playerRows, error: playersError } = await supabase
+        .from('players')
+        .select('sleeper_id, stock_code, full_name, position, team')
+        .not('stock_code', 'is', null)
+        .neq('stock_code', '');
+      if (cancelled) return;
+      if (playersError) {
+        setStockError(tickerError?.message || playersError.message || 'Could not load stock.');
+        return;
+      }
+      setStockError('');
+      setPlayers((playerRows || []).map((player) => ({
+        ...player,
+        player_position: player.position,
+        full_name: player.full_name,
+        pct_change: null,
+        today_dollars: null,
+        yesterday_dollars: null,
+      })));
+    }
+    loadStock().catch((error) => { if (!cancelled) setStockError(error.message || 'Could not load stock.'); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const sortedPlayers = useMemo(() => [...players].sort((a, b) => {
+    const growth = (row) => movementPercent(row, players.indexOf(row));
+    if (sort === 'position') return String(a.player_position).localeCompare(String(b.player_position)) || String(a.stock_code).localeCompare(String(b.stock_code));
+    if (sort === 'team') return String(a.team || 'FA').localeCompare(String(b.team || 'FA')) || String(a.stock_code).localeCompare(String(b.stock_code));
+    if (sort === 'name') return String(a.full_name).localeCompare(String(b.full_name));
+    if (sort === 'risers') return growth(b) - growth(a);
+    if (sort === 'fallers') return growth(a) - growth(b);
+    return Number(b.today_dollars || 0) - Number(a.today_dollars || 0);
+  }), [players, sort]);
+
+  return (
+    <section className="stock-strip" aria-label="Player stock">
+      <div className="stock-heading">
+        <select value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort player stock">
+          {STOCK_SORTS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+      </div>
+      <div className="stock-track" key={sort}>
+        {[...sortedPlayers, ...sortedPlayers].map((player, index) => {
+          const growthPct = movementPercent(player, players.indexOf(player));
+          const rising = growthPct >= 0;
+          return (
+            <div
+              className="stock-quote"
+              key={`${player.sleeper_id}-${index}`}
+              onClick={() => openPlayer(player)}
+            >
+              <span className="stock-quote-normal"><strong style={{ color: STOCK_POSITION_COLORS[player.player_position] || 'var(--color-text)' }}>{player.stock_code}</strong> <span className={rising ? 'stock-up' : 'stock-down'}>{Math.abs(growthPct).toFixed(1)}% {rising ? '▲' : '▼'}</span></span>
+              <span className="stock-quote-hover"><strong style={{ color: NFL_TEAM_COLORS[player.team] || 'var(--color-text)' }}>{player.full_name || player.stock_code}</strong> <span style={{ color: STOCK_POSITION_COLORS[player.player_position] || 'var(--color-text)' }}>({player.stock_code})</span> <span className={rising ? 'stock-up' : 'stock-down'}>{Math.abs(growthPct).toFixed(1)}% {rising ? '▲' : '▼'}</span></span>
+            </div>
+          );
+        })}
+        {stockError && <span className="error-text">Stock unavailable: {stockError}</span>}
+        {!stockError && sortedPlayers.length === 0 && <span className="muted-text">Loading stock...</span>}
+      </div>
+      {selectedPlayer && <PlayerStockModal player={selectedPlayer} stats={playerStats[selectedPlayer.sleeper_id]} games={playerGames[selectedPlayer.sleeper_id]} onClose={() => setSelectedPlayer(null)} />}
+    </section>
+  );
+}
 
 const featureBars = [
   {
@@ -159,6 +354,8 @@ export default function Landing({ onNavigate, authMode = null }) {
           </button>
         </div>
       </header>
+
+      <LandingStockExchange />
 
       <main className="landing-main">
         <div className="feature-bar-stack" aria-label="League features">
