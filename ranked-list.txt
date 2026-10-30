@@ -1,30 +1,26 @@
 Jahmyr Gibbs
+Jaxon Smith-Njigba
 Bijan Robinson
 Christian McCaffrey
 Puka Nacua
 Ja'Marr Chase
-Jaxon Smith-Njigba
 Amon Ra St Brown
 Jonathan Taylor
 CeeDee Lamb
-Ashton Jeanty
 Justin Jefferson
-Omarion Hampton
+Jaylen Warren
 James Cook
-AJ Brown
+Malik Nabers
 Drake London
-Chase Brown
-Rashee Rice
-Saquon Barkley
-De'Von Achane
+Brock Bowers
+Trey McBride
+Zay Flowers
 Derrick Henry
 Kenneth Walker III
 Jeremiyah Love
 George Pickens
 Josh Jacobs
 Nico Collins
-Brock Bowers
-Trey McBride
 Tee Higgins
 Chris Olave
 Josh Allen
@@ -33,22 +29,20 @@ Emeka Egbuka
 Javonte Williams
 Kyren Williams
 Tetairoa McMillan
-Ladd McConkey
-Zay Flowers
 Lamar Jackson
 Joe Burrow
+Christian Watson
 Jayden Daniels
-Malik Nabers
 Cam Skattebo
 Drake Maye
 Mike Evans
 Breece Hall
-Davante Adams
 Quinshon Judkins
 Luther Burden III
-TreVeyon Henderson
 D'Andre Swift
-Jaylen Waddle
+Chase Brown
+Rashee Rice
+Saquon Barkley
 Garrett Wilson
 Colston Loveland
 Rome Odunze
@@ -64,19 +58,19 @@ Tucker Kraft
 Jalen Hurts
 Caleb Williams
 Tyler Warren
-Christian Watson
+Omar Cooper Jr.
 David Montgomery
 Brian Thomas Jr.
 Marvin Harrison Jr.
 Rico Dowdle
 Tony Pollard
 DK Metcalf
+Jaylen Waddle
 Jaxson Dart
 Justin Herbert
 Trevor Lawrence
 J.K. Dobbins
 Harold Fannin Jr.
-Jaylen Warren
 Quentin Johnston
 Michael Wilson
 Alec Pierce
@@ -89,9 +83,12 @@ Kyle Monangai
 Jordyn Tyson
 Makai Lemon
 Jordan Addison
+AJ Brown
 Michael Pittman Jr.
+Ladd McConkey
 RJ Harvey
 Dak Prescott
+Omarion Hampton
 Sam LaPorta
 Kyle Pitts Sr.
 Wan'Dale Robinson
@@ -108,6 +105,7 @@ Matthew Stafford
 Jared Goff
 Woody Marks
 Tyjae Spears
+TreVeyon Henderson
 Dalton Kincaid
 Travis Kelce
 De'Zhaun Stribling
@@ -166,8 +164,8 @@ Adonai Mitchell
 Jalen McMillan
 Denzel Boston
 Emanuel Wilson
-Omar Cooper Jr.
 Tre Tucker
+Davante Adams
 Travis Hunter
 Kimani Vidal
 Kayshon Boutte
@@ -264,6 +262,7 @@ Shedeur Sanders
 LeQuint Allen Jr.
 Seth McGowan
 Erick All Jr.
+De'Von Achane
 Jerome Ford
 Skyler Bell
 Brashard Smith

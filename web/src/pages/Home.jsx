@@ -780,13 +780,16 @@ function StockTicker() {
   });
 
   return (
-    <div>
+    <div style={{ width: '100%', minWidth: 0, overflow: 'hidden' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 8 }}>
         <strong>Market Ticker</strong>
         <select value={sort} onChange={(e) => setSort(e.target.value)} aria-label="Sort market ticker" style={{ width: 135, fontSize: '0.7rem', padding: '4px 24px 4px 6px' }}>
           <option value="value">Overall value</option><option value="position">Position</option><option value="team">Team</option><option value="name">Name</option><option value="risers">Biggest risers</option><option value="fallers">Biggest fallers</option>
         </select>
       </div>
+      {/* Clip window: the track is twice the list long (for a seamless loop),
+          so it must never be allowed to set the width of the page. */}
+      <div style={{ width: '100%', minWidth: 0, overflow: 'hidden' }}>
       <div className="stock-track" key={sort}>
       {[...sortedRows, ...sortedRows].map((r, index) => {
         const movement = Number(r.pct_change) !== 0
@@ -801,6 +804,7 @@ function StockTicker() {
           </span>
         );
       })}
+      </div>
       </div>
       {selectedPlayer && <PlayerStockModal player={selectedPlayer} stats={playerStats[selectedPlayer.sleeper_id]} onClose={() => setSelectedPlayer(null)} />}
     </div>
@@ -2230,7 +2234,7 @@ function minutesUntilAuction() {
             </>
           )}
         </div>
-        <div className="home-stock-header"><StockTicker /></div>
+        <div className="home-stock-header" style={{ minWidth: 0, overflow: 'hidden' }}><StockTicker /></div>
       </div>
 
       <div className={`quadrant quadrant-1 ${mobileActiveTab === 'rankings' ? 'mobile-active' : ''}`} style={{ cursor: 'pointer' }} onClick={openFullRankings}>
